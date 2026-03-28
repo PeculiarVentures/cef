@@ -274,7 +274,8 @@ the IANA COSE Algorithms registry (RFC 9053 §2.1). The value **-16**
 denotes SHA-256. Implementations MUST support SHA-256 (-16).
 Implementations MAY support additional algorithms (e.g., SHA-384 = -43,
 SHA-512 = -44). Implementations MUST verify the hash after decryption
-and SHOULD report hash mismatches to the user.
+using constant-time comparison to prevent timing side-channels, and
+SHOULD report hash mismatches to the user.
 
 The `created_at` claim is a sender-asserted RFC 3339 timestamp indicating
 when the container was created. Like all claims, this value is NOT
@@ -313,6 +314,15 @@ The `original_name` field contains only the filename (no directory path).
 Implementations MUST use `filepath.Base()` or equivalent to prevent path
 traversal attacks. Filenames containing path separators, "..", or other
 dangerous patterns SHOULD be sanitized or rejected.
+
+### 3.5 Truncation Detection
+
+After decrypting the manifest, implementations MUST verify that every
+file entry in the manifest has a corresponding encrypted file in the ZIP
+container. If any file listed in the manifest is absent from the
+container, the implementation MUST reject the container with an error
+indicating possible truncation. This prevents an attacker from stripping
+files from a container while leaving the manifest and signature intact.
 
 ## 4. Cryptographic Structures
 
@@ -400,12 +410,34 @@ field contains `ct || wrappedCEK` where:
 
 The total ciphertext for ML-KEM-768+A256KW is 1128 bytes (1088 + 40).
 
+**Key sizes for validation**: Implementations MUST validate key sizes on
+input. The following sizes are normative for the supported algorithms:
+
+| Key Type | Bytes | Description |
+|----------|-------|-------------|
+| ML-KEM-768 encapsulation (public) key | 1184 | Standard encoding per FIPS 203 |
+| ML-KEM-768 ciphertext | 1088 | Per FIPS 203 §7.2 |
+| ML-KEM-768 shared secret | 32 | Per FIPS 203 §7.2 |
+| ML-DSA-65 verifying (public) key | 1952 | Standard encoding per FIPS 204 |
+| ML-DSA-65 signature | 3309 | Per FIPS 204 §7.2 |
+
+Private (decapsulation/signing) key serialization is out of scope. The
+format specifies only the public key and ciphertext sizes that appear in
+or are derived from the container. Private key encoding is an
+implementation and backend concern — different libraries use different
+internal representations (seeds, expanded keys) for the same algorithm.
+
 **Classical key wrap flow**: For A256KW recipients, the ciphertext field
 contains the 40-byte AES Key Wrap output directly.
 
 **Key ID (label 4)**: A byte string containing the key identifier.
 This identifies the key used for encapsulation/wrapping and is used by the
-recipient to select the correct decapsulation/unwrap operation.
+recipient to select the correct decapsulation/unwrap operation. The COSE
+Key ID is the UTF-8 encoding of the manifest `kid` text string.
+Implementations MUST encode the `kid` as UTF-8 bytes in the COSE
+unprotected header and as a text string in the manifest. When matching
+a recipient, implementations MUST compare the COSE `kid` bytes against
+the UTF-8 encoding of the manifest `kid` string.
 
 **Mixed recipients**: A single COSE_Encrypt message MAY contain recipients
 with different algorithms. This allows a container to have both ML-KEM-768
@@ -433,10 +465,16 @@ COSE_Sign1_Tagged = #6.18(COSE_Sign1)
 COSE_Sign1 = [
     protected:   bstr .cbor { 1: alg_id },    ; see algorithm table below
     unprotected: { 4: bstr },               ; kid: signer key ID
-    payload:     nil,                        ; detached
+    payload:     nil,                        ; detached (MUST be CBOR null)
     signature:   bstr                        ; signature bytes
 ]
 ```
+
+The detached payload MUST be encoded as CBOR null (major type 7, value
+22), NOT as an empty byte string (h''). Implementations that encode the
+detached payload as empty bytes will produce containers that fail
+signature verification in other implementations. This was identified as
+a real interop bug between the Go and TypeScript SDKs.
 
 The signature is computed over the Sig_structure1 (RFC 9052 §4.4):
 
@@ -762,6 +800,13 @@ the manifest. Deterministic encoding ensures that:
 - Signatures are reproducible across implementations.
 - Test vectors can be validated byte-for-byte.
 - Content-addressing schemes (if used) produce consistent hashes.
+
+Deterministic encoding requires minimum-width integer encoding: integers
+MUST be encoded in the smallest CBOR integer representation that can hold
+the value. Algorithm identifiers (e.g., 3, -49, -70010) and file sizes
+MUST use the minimum number of bytes. Implementations SHOULD NOT encode
+integers wider than i64 in the manifest; all defined fields fit within
+the i64 range.
 
 ### 6.11 Manifest and File Recipient Sets
 
