@@ -198,6 +198,30 @@ dec, _ := cef.Decrypt(result.Container, cef.DecryptOptions{
 })
 ```
 
+## Example (Rust, post-quantum)
+
+```rust
+use cef::{encrypt, decrypt, EncryptOptions, DecryptOptions, Sender, Recipient, FileInput};
+use cef::format::pq::{mlkem_keygen, mldsa_keygen};
+
+let sender = mldsa_keygen();
+let recip = mlkem_keygen();
+
+let result = encrypt(EncryptOptions {
+    files: vec![FileInput { name: "secret.pdf".into(), data: doc_bytes, content_type: None }],
+    sender: Sender { signing_key: sender.secret_key, kid: "alice".into(), x5c: None, claims: None },
+    recipients: vec![Recipient { kid: "bob".into(), encryption_key: recip.public_key, recipient_type: None }],
+    timestamp: None,
+}).unwrap();
+
+let dec = decrypt(&result.container, DecryptOptions {
+    recipient_kid: "bob".into(),
+    decryption_key: recip.secret_key,
+    verify_key: Some(sender.public_key),
+    skip_signature_verification: false,
+}).unwrap();
+```
+
 ## Repository Structure
 
 ```
@@ -210,14 +234,23 @@ cef/
 │   └── test-vectors/          Interoperability test vectors
 │
 └── sdk/
-    └── go/                    Go SDK (reference implementation)
-        ├── format/            Format layer (implementable by anyone)
-        │   ├── crypto/        AES Key Wrap (RFC 3394), KDF, zeroize
-        │   ├── cose/          COSE_Encrypt, COSE_Sign1
-        │   └── container/     ZIP structure, CBOR manifest
-        └── goodkey/           GoodKey key management integration
-            ├── exchange/      EncryptFiles, DecryptContainer, VerifyContainer
-            └── ipc/           GoodKey service client + mock
+    ├── go/                    Go SDK (reference implementation)
+    │   ├── cef/               Workflow API: Encrypt/Decrypt/Verify
+    │   ├── format/            Format layer (implementable by anyone)
+    │   │   ├── crypto/        AES Key Wrap (RFC 3394), HKDF, zeroize
+    │   │   ├── cose/          COSE_Encrypt, COSE_Sign1
+    │   │   └── container/     ZIP structure, CBOR manifest
+    │   └── goodkey/           GoodKey key management integration
+    │       ├── exchange/      EncryptFiles, DecryptContainer, VerifyContainer
+    │       └── ipc/           GoodKey service client + mock
+    │
+    ├── typescript/            TypeScript SDK
+    │   ├── src/cef.ts         Workflow API: encrypt/decrypt/verify
+    │   └── src/format/        Format layer (COSE, container, crypto, PQ)
+    │
+    └── rust/                  Rust SDK
+        ├── src/lib.rs         Workflow API: encrypt/decrypt/verify
+        └── src/format/        Format layer (COSE, container, crypto, PQ)
 ```
 
 ## Specification
@@ -233,6 +266,7 @@ containers matching the spec is interoperable.
 |----------|------|--------|
 | Go | `sdk/go/` | Reference implementation (classical + PQ) |
 | TypeScript | `sdk/typescript/` | v0 prototyping (classical via WebCrypto, PQ via @noble/post-quantum) |
+| Rust | `sdk/rust/` | PQ implementation (ML-KEM-768 + ML-DSA-65 via RustCrypto) |
 
 The Go SDK includes both the format layer (`format/`) and a GoodKey-backed
 implementation (`goodkey/`). The format layer has no GoodKey dependency and

@@ -1,0 +1,29 @@
+[package]
+name = "cef"
+version = "0.1.0"
+edition = "2021"
+description = "CEF: COSE Encrypted Files — post-quantum secure file exchange format"
+license = "BSD-3-Clause"
+repository = "https://github.com/PeculiarVentures/cef"
+
+[dependencies]
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+kem = { version = "0.3.0-rc.6", features = ["getrandom"] }
+ml-dsa = "0.1.0-rc.8"
+aes-gcm = "0.10"
+aes-kw = "0.3.0-rc.2"
+hkdf = "0.12"
+sha2 = "0.10"
+ciborium = "0.2"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+rand = "0.9"
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["std", "sys_rng"] }
+thiserror = "2"
+zeroize = "1"
+subtle = "2"
+base64 = "0.22"
+hex = "0.4"
+serde_json = "1"
+
+[dev-dependencies]

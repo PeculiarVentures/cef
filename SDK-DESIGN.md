@@ -186,28 +186,49 @@ import "github.com/PeculiarVentures/cef/x509"
 import "github.com/PeculiarVentures/cef/timestamp"
 ```
 
-### Rust (future)
+### Rust
 
 ```rust
-use cef::{encrypt, decrypt, EncryptOptions, Sender, Recipient};
+use cef::{encrypt, decrypt, verify, EncryptOptions, DecryptOptions, VerifyOptions};
+use cef::{Sender, Recipient, FileInput};
+use cef::format::pq::{mlkem_keygen, mldsa_keygen};
+
+let sender = mldsa_keygen();
+let recip = mlkem_keygen();
 
 let result = encrypt(EncryptOptions {
-    files: vec![FileInput::new("report.pdf", pdf_bytes)],
-    sender: Sender::new(sender_sec, "alice"),
-    recipients: vec![Recipient::key("bob", bob_pub)],
-    ..Default::default()
+    files: vec![FileInput {
+        name: "report.pdf".into(),
+        data: pdf_bytes,
+        content_type: Some("application/pdf".into()),
+    }],
+    sender: Sender {
+        signing_key: sender.secret_key,
+        kid: "alice".into(),
+        x5c: None,
+        claims: Some(SenderClaims {
+            email: Some("alice@example.com".into()),
+            classification: Some("SECRET".into()),
+            ..Default::default()
+        }),
+    },
+    recipients: vec![Recipient {
+        kid: "bob".into(),
+        encryption_key: recip.public_key,
+        recipient_type: None,
+    }],
+    timestamp: None,
 })?;
 
 let dec = decrypt(&result.container, DecryptOptions {
-    recipient: RecipientKey::new("bob", bob_sec),
-    verify: Some(sender_pub.into()),
+    recipient_kid: "bob".into(),
+    decryption_key: recip.secret_key,
+    verify_key: Some(sender.public_key),
+    skip_signature_verification: false,
 })?;
 
-// Core primitives behind feature flag
-use cef::core::{cose, container};
-
-// GoodKey behind feature flag
-use cef::goodkey::GoodKeyAdapter;
+// Format layer available directly
+use cef::format::{cose, container, crypto, pq};
 ```
 
 ### Python (future)
