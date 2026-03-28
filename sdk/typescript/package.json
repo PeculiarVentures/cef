@@ -1,0 +1,44 @@
+{
+  "name": "@peculiarventures/cef",
+  "version": "0.0.1",
+  "description": "CEF (COSE Encrypted Files) format implementation for browser and Node.js",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./core": "./dist/src/format/index.js",
+    "./x509": "./dist/src/x509/index.js",
+    "./timestamp": "./dist/src/timestamp/index.js",
+    "./format": "./dist/src/format/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/test/*.test.js",
+    "dev": "tsc --watch",
+    "docs": "typedoc"
+  },
+  "dependencies": {
+    "@noble/post-quantum": "^0.5.4",
+    "@peculiar/asn1-cms": "^2.6.1",
+    "@peculiar/asn1-pkcs9": "^2.6.1",
+    "@peculiar/asn1-schema": "^2.6.0",
+    "@peculiar/asn1-tsp": "^2.6.1",
+    "@peculiar/asn1-x509": "^2.6.1",
+    "@peculiar/certificates-viewer": "^4.9.1",
+    "@peculiar/x509": "^2.0.0",
+    "cbor-x": "^1.6.0",
+    "fflate": "^0.8.2",
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.27.4",
+    "typedoc": "^0.28.18",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "BSD-3-Clause"
+}

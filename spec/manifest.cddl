@@ -1,0 +1,84 @@
+; CEF Manifest CDDL Schema (RFC 8610)
+;
+; This defines the CBOR structure of the CEF manifest, which is encrypted
+; inside the container as META-INF/manifest.cbor.cose.
+
+cef-manifest = {
+  version: tstr,               ; Format version ("0" for draft)
+  sender: sender-info,
+  recipients: [+ recipient-ref],
+  files: { + tstr => file-metadata },
+}
+
+sender-info = {
+  kid: tstr,                   ; Key identifier (required)
+  ? x5c: [+ bstr],            ; X.509 certificate chain (DER, leaf-first)
+  ? claims: sender-claims,    ; Unverified sender claims (mutually exclusive with x5c)
+}
+
+sender-claims = {
+  ? email: tstr,
+  ? name: tstr,
+  ? created_at: tstr,         ; ISO 8601 timestamp (sender-asserted, unverified)
+
+  ; Handling marks — sender-asserted labels analogous to markings on an
+  ; envelope. These aid the recipient (human or automated) in understanding
+  ; how to handle the contents. Security guarantees are NOT delivered through
+  ; these labels — they are delivered through the policies associated with
+  ; the key material. The key management backend MAY refuse to wrap or
+  ; unwrap CEKs for keys not authorized for the asserted markings.
+  ? classification: tstr,     ; e.g. "TOP SECRET", "SECRET", "CONFIDENTIAL"
+  ? sci_controls: [* tstr],   ; SCI codewords, e.g. ["HCS", "SI", "TK"]
+  ? sap_programs: [* tstr],   ; SAP program identifiers
+  ? dissemination: [* tstr],  ; e.g. ["NOFORN", "ORCON", "FOUO"]
+  ? releasability: tstr,      ; e.g. "REL TO USA, FVEY"
+}
+
+recipient-ref = {
+  kid: tstr,                   ; Key identifier (required)
+  ? type: tstr,                ; "key" | "certificate" | "group"
+  ? x5c: [+ bstr],            ; X.509 certificate chain (DER, leaf-first)
+  ? claims: recipient-claims,  ; Unverified recipient claims (mutually exclusive with x5c)
+  ? logical_key_id: tstr,      ; Logical key identifier for key rotation
+  ? version_id: tstr,          ; Key version identifier
+  ? policy_ref: tstr,          ; Policy reference URI
+}
+
+recipient-claims = {
+  ? email: tstr,
+  ? name: tstr,
+  ? group_id: tstr,
+}
+
+file-metadata = {
+  original_name: tstr,         ; Original filename (no path components)
+  hash: bstr,                  ; SHA-256 digest of plaintext
+  hash_algorithm: int,         ; COSE algorithm ID (-16 = SHA-256)
+  size: uint,                  ; Plaintext size in bytes
+  ? content_type: tstr,        ; MIME type
+}
+
+; COSE Algorithm Identifiers (subset used by CEF)
+;
+; Content encryption:
+;   3  = AES-256-GCM (RFC 9053 §4.1)
+;
+; Key wrapping:
+;   -70010 = ML-KEM-768 + AES-256 Key Wrap (draft, pending IANA)
+;   -3     = A256KW (AES-256 Key Wrap, RFC 3394)
+;
+; Signing:
+;   -49    = ML-DSA-65 (FIPS 204, draft, pending IANA)
+;
+; Hash:
+;   -16    = SHA-256
+
+; Container structure (ZIP archive):
+;
+; container.cef
+; ├── META-INF/
+; │   ├── manifest.cbor.cose    ; COSE_Encrypt(cef-manifest)
+; │   ├── manifest.cose-sign1   ; COSE_Sign1 detached signature
+; │   └── manifest.tst          ; Optional RFC 3161 timestamp token
+; └── encrypted/
+;     └── <random>.cose         ; COSE_Encrypt(file plaintext) per file

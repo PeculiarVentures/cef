@@ -1,0 +1,1329 @@
+<!DOCTYPE html>
+<!--
+  CEF In-Browser Demo
+  ====================
+  Interactive demonstration of the CEF (COSE Encrypted Files) format.
+  All cryptography runs in-browser via @noble/post-quantum. No backend.
+
+  Bundles (all vendored locally, zero CDN dependencies):
+    cef-sdk.js         COSE/CBOR format layer, container read/write, exchange API
+    cef-pq.js          ML-KEM-768 (FIPS 203) + ML-DSA-65 (FIPS 204)
+    cef-timestamp.js   RFC 3161 timestamp request/parse/verify
+    cef-cert.js        X.509 certificate utilities + self-signed ML-DSA-65 generation
+    vendor/pv-cert/    @peculiar/certificates-viewer web component
+
+  Demo flow:
+    1. Page load         → Auto-generates ML-DSA-65 sender cert + first recipient
+    2. Add files         → Drop or browse, + Add another sample file
+    3. Encrypt & Sign    → AES-256-GCM + ML-KEM-768 wrap + ML-DSA-65 signature
+    4. Open Container    → Auto-decrypts, inspect structure, verify signature, view certs
+
+  Source & spec: https://github.com/PeculiarVentures/cef
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CEF Demo</title>
+
+<!-- Certificate viewer web component (vendored locally, no CDN) -->
+<script type="module" src="./vendor/pv-cert/peculiar.esm.js"></script>
+<link rel="stylesheet" href="./vendor/pv-cert/peculiar.css" />
+
+<style>
+/* ======================================================================
+   Design Tokens
+   ====================================================================== */
+:root {
+  --mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', ui-monospace, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+
+  --ink:     #0c1222;  --ink-2:   #1e293b;  --ink-3:   #475569;  --ink-4: #94a3b8;
+  --bg:      #f1f5f9;  --surface: #fff;     --border:  #e2e8f0;
+  --blue:    #2563eb;  --blue-bg: rgba(37,99,235,.06);  --blue-h: #1d4ed8;
+  --green:   #059669;  --green-bg:rgba(5,150,105,.06);
+  --red:     #dc2626;  --red-bg:  rgba(220,38,38,.06);
+  --purple:  #7c3aed;  --purple-bg:rgba(124,58,237,.06);
+  --amber:   #d97706;  --amber-bg:rgba(217,119,6,.06);
+  --radius:  8px;      --radius-lg: 12px;
+}
+
+/* ======================================================================
+   Reset & Base
+   ====================================================================== */
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:var(--sans); color:var(--ink); background:var(--bg); line-height:1.5; -webkit-font-smoothing:antialiased; }
+
+/* ======================================================================
+   Header
+   ====================================================================== */
+.header { background:var(--ink); padding:28px 20px 24px; text-align:center; }
+.header h1 { font-size:22px; font-weight:700; color:#fff; letter-spacing:-.4px; }
+.header h1 em { font-style:normal; color:#a78bfa; font-weight:400; }
+.header p { font-size:13px; color:var(--ink-4); margin-top:6px; max-width:560px; margin-inline:auto; line-height:1.6; }
+.wrap { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+
+/* ======================================================================
+   Intro Cards
+   ====================================================================== */
+.intro { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px; }
+.intro-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:18px 20px; }
+.intro-card h3 { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.8px; color:var(--ink-3); margin-bottom:10px; }
+
+/* Container diagram */
+.tree { font-family:var(--mono); font-size:11px; line-height:1.9; color:var(--ink-3); }
+.tree .dir  { color:var(--ink-2); font-weight:600; }
+.tree .enc  { color:var(--purple); }
+.tree .meta { color:var(--blue); }
+.tree .note { color:var(--ink-4); font-style:italic; font-family:var(--sans); font-size:10px; }
+
+/* Leak table */
+.leak-tbl { width:100%; border-collapse:collapse; font-size:10px; line-height:1.5; margin-top:10px; }
+.leak-tbl th { text-align:left; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-4); padding:4px 8px; border-bottom:2px solid var(--border); }
+.leak-tbl td { padding:5px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+.leak-tbl .lbl { font-weight:600; color:var(--ink-2); white-space:nowrap; width:80px; }
+.leak-tbl .exp { color:var(--amber); }
+.leak-tbl .prt { color:var(--green); }
+
+/* ======================================================================
+   Nav Links
+   ====================================================================== */
+.nav { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-bottom:16px; }
+.nav a { display:flex; flex-direction:column; align-items:center; text-align:center; padding:10px 6px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); text-decoration:none; transition:all 150ms; }
+.nav a:hover { border-color:var(--blue); background:var(--blue-bg); }
+.nav .ic { font-size:18px; margin-bottom:2px; }
+.nav .lb { font-size:11px; font-weight:600; color:var(--ink-2); }
+.nav .ds { font-size:9px; color:var(--ink-4); margin-top:1px; }
+
+/* ======================================================================
+   Sender Identity
+   ====================================================================== */
+.keys { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:16px 20px; margin-bottom:16px; }
+.keys h3 { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.8px; color:var(--ink-3); margin-bottom:8px; }
+.kr { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+.kr:last-child { margin-bottom:0; }
+.kr label { font-size:11px; font-weight:600; color:var(--ink-2); min-width:75px; flex-shrink:0; }
+.kr code { font-family:var(--mono); font-size:10px; color:var(--ink-3); background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:4px 10px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sender-type-row { display:flex; gap:6px; }
+.sender-type-row select { flex:1; font-size:11px; padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius); font-family:var(--sans); color:var(--ink-2); background:var(--surface); }
+
+/* ======================================================================
+   Panels (Encrypt / Open Container)
+   ====================================================================== */
+.panels { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.panel { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg); overflow:hidden; }
+.panel-hd { padding:12px 18px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; }
+.panel-hd h2 { font-size:14px; font-weight:700; }
+.panel-bd { padding:16px 18px; }
+.badge { font-size:9px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; padding:2px 7px; border-radius:3px; }
+.badge-pq { background:var(--purple-bg); color:var(--purple); }
+.badge-ok { background:var(--green-bg); color:var(--green); }
+
+/* Panel gating */
+.panel.locked .panel-bd>*:not(.gate):not(.dz):not(input[type="file"]) { opacity:.3; pointer-events:none; user-select:none; }
+.panel.locked .panel-bd>.gate { display:flex; }
+.gate { display:none; align-items:center; justify-content:center; padding:12px; margin-bottom:10px; font-size:12px; font-weight:500; color:var(--ink-4); background:var(--bg); border:1px dashed var(--border); border-radius:var(--radius); text-align:center; }
+
+/* ======================================================================
+   Dropzone, File List, Buttons, Options
+   ====================================================================== */
+.dz { border:2px dashed var(--border); border-radius:var(--radius); padding:24px 16px; text-align:center; cursor:pointer; background:var(--bg); transition:all 150ms; }
+.dz:hover,.dz.over { border-color:var(--blue); background:var(--blue-bg); }
+.dz .icon { font-size:24px; margin-bottom:4px; }
+.dz p { font-size:12px; color:var(--ink-3); }
+.dz p b { color:var(--blue); }
+
+.btn-sample { width:100%; padding:6px; margin-top:6px; font-size:11px; font-weight:500; border:1px dashed var(--border); background:var(--bg); color:var(--ink-3); border-radius:var(--radius); cursor:pointer; transition:all 150ms; }
+.btn-sample:hover { border-color:var(--blue); color:var(--blue); background:var(--blue-bg); }
+.btn-small { font-size:10px; padding:4px 12px; border-radius:4px; border:1px solid var(--border); background:var(--surface); color:var(--ink-3); cursor:pointer; font-family:var(--sans); transition:all 150ms; }
+.btn-small:hover { border-color:var(--blue); color:var(--blue); background:var(--blue-bg); }
+
+/* Recipients section */
+.recipients-section { margin-top:12px; }
+.section-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.6px; color:var(--ink-3); margin-bottom:6px; }
+.add-recipient-row { display:flex; gap:6px; margin-top:8px; }
+.add-recipient-row select { font-size:11px; padding:5px 8px; border:1px solid var(--border); border-radius:4px; font-family:var(--sans); color:var(--ink-2); min-width:100px; background:var(--surface); }
+.recipient-note { font-size:9px; color:var(--ink-4); margin-top:4px; }
+.recipient-item { display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); margin-top:5px; font-size:11px; cursor:pointer; transition:all 150ms; min-height:36px; }
+.recipient-item:hover { border-color:var(--ink-4); }
+.recipient-item.active { border-color:var(--green); background:var(--green-bg); }
+.recipient-item .r-type { font-size:9px; font-weight:700; padding:2px 6px; border-radius:3px; text-transform:uppercase; flex-shrink:0; }
+.recipient-item .r-type-key { background:var(--purple-bg); color:var(--purple); }
+.recipient-item .r-type-cert { background:var(--green-bg); color:var(--green); }
+.recipient-item .r-value { flex:1; font-family:var(--mono); font-size:10px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.recipient-item .r-self { font-size:9px; color:var(--ink-4); font-style:italic; flex-shrink:0; }
+.recipient-item .remove { color:var(--ink-4); cursor:pointer; font-size:14px; border:none; background:none; padding:4px; }
+.recipient-item .remove:hover { color:var(--red); }
+
+.fi { display:flex; align-items:center; gap:6px; padding:7px 10px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); margin-top:6px; font-size:12px; min-height:36px; }
+.fi .n { flex:1; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.fi .sz { color:var(--ink-3); font-size:10px; font-family:var(--mono); flex-shrink:0; }
+.fi .rm { color:var(--ink-3); cursor:pointer; font-size:14px; border:none; background:none; padding:4px; }
+.fi .rm:hover { color:var(--red); }
+
+.btn { display:flex; align-items:center; justify-content:center; gap:6px; padding:10px; font-size:13px; font-weight:600; border-radius:var(--radius); border:none; cursor:pointer; width:100%; margin-top:12px; transition:all 150ms; }
+.btn:disabled { opacity:.35; cursor:not-allowed; }
+.btn-p { background:var(--blue); color:#fff; }
+.btn-p:hover:not(:disabled) { background:var(--blue-h); }
+.btn-g { background:var(--green); color:#fff; }
+.btn-g:hover:not(:disabled) { background:#047857; }
+
+.opts { margin-top:12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.opts label { font-size:11px; color:var(--ink-3); display:flex; align-items:center; gap:4px; cursor:pointer; }
+.opts select { font-size:11px; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-family:var(--sans); color:var(--ink-2); max-width:200px; background:var(--surface); }
+
+/* ======================================================================
+   Results, Inspection, File Browser
+   ====================================================================== */
+.res { margin-top:12px; padding:12px 14px; border-radius:var(--radius); font-size:12px; }
+.res.ok  { background:var(--green-bg); border:1px solid rgba(5,150,105,.15); }
+.res.err { background:var(--red-bg); border:1px solid rgba(220,38,38,.15); color:var(--red); }
+.res.inf { background:var(--blue-bg); border:1px solid rgba(37,99,235,.15); }
+.res .m  { font-size:10px; color:var(--ink-3); margin-top:6px; font-family:var(--mono); line-height:1.7; }
+.res .m span { display:inline-block; margin-right:14px; margin-bottom:2px; }
+.dlk { display:inline-flex; align-items:center; gap:3px; color:var(--blue); font-weight:600; text-decoration:none; font-size:12px; margin-top:8px; }
+.dlk:hover { text-decoration:underline; }
+
+/* Collapsible inspection sections */
+.insp { margin-top:10px; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+.insp-h { padding:10px 14px; background:var(--bg); border-bottom:1px solid var(--border); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-3); cursor:pointer; display:flex; align-items:center; gap:6px; user-select:none; min-height:38px; }
+.insp-h .arr { transition:transform 150ms; font-size:8px; }
+.insp-h.open .arr { transform:rotate(90deg); }
+.insp-b { padding:12px 14px; display:none; }
+.insp-b.open { display:block; }
+
+/* Key-value rows */
+.kv { display:flex; gap:8px; font-size:11px; padding:4px 0; border-bottom:1px dotted var(--border); }
+.kv:last-child { border-bottom:none; }
+.kv .k { font-weight:600; color:var(--ink-2); min-width:110px; flex-shrink:0; }
+.kv .v { color:var(--ink-3); font-family:var(--mono); font-size:10px; word-break:break-all; }
+.kv .v.ok  { color:var(--green); font-weight:600; }
+.kv .v.bad { color:var(--red); font-weight:600; }
+.kv .v.wrn { color:var(--amber); font-weight:600; }
+
+/* File browser */
+.fb { border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-top:10px; }
+.fb-hd { padding:8px 12px; background:var(--bg); border-bottom:1px solid var(--border); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-3); }
+.fbr { display:flex; align-items:center; gap:6px; padding:6px 12px; border-bottom:1px solid var(--border); font-size:11px; min-height:32px; }
+.fbr:last-child { border-bottom:none; }
+.fbr .icon { width:16px; text-align:center; font-size:12px; flex-shrink:0; }
+.fbr .fn { flex:1; font-weight:500; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.fbr .fs { color:var(--ink-3); font-family:var(--mono); font-size:10px; flex-shrink:0; }
+.fbr .tg { font-size:9px; font-weight:700; padding:2px 6px; border-radius:3px; flex-shrink:0; }
+.fbr .tg.ok  { background:var(--green-bg); color:var(--green); }
+.fbr .tg.bad { background:var(--red-bg); color:var(--red); }
+.fbr .dl { color:var(--blue); text-decoration:none; font-size:11px; flex-shrink:0; }
+.fbr.dir { background:var(--bg); }
+.fbr.dir .fn { color:var(--ink-3); font-weight:600; }
+
+/* Spinner */
+.spin { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,.3); border-top-color:#fff; border-radius:50%; animation:sp .6s linear infinite; }
+@keyframes sp { to { transform:rotate(360deg); } }
+
+/* Footer */
+.footer { text-align:center; padding:24px 16px; font-size:11px; color:var(--ink-4); }
+.footer a { color:var(--blue); text-decoration:none; }
+.footer a:hover { text-decoration:underline; }
+
+/* ======================================================================
+   Responsive — Mobile-first adjustments
+   ====================================================================== */
+@media(max-width:760px) {
+  .header { padding:20px 16px 18px; }
+  .header h1 { font-size:18px; }
+  .header p { font-size:12px; }
+  .wrap { padding:14px 12px 32px; }
+
+  .intro { grid-template-columns:1fr; gap:12px; }
+  .intro-card { padding:14px 16px; }
+
+  .nav { grid-template-columns:repeat(3,1fr); gap:6px; }
+  .nav a { padding:8px 4px; }
+  .nav .ds { display:none; }
+
+  .keys { padding:14px 14px; }
+  .kr { flex-wrap:wrap; gap:4px; }
+  .kr label { min-width:auto; font-size:10px; }
+  .kr code { font-size:9px; padding:3px 6px; }
+
+  .panels { grid-template-columns:1fr; gap:12px; }
+  .panel-hd { padding:10px 14px; }
+  .panel-bd { padding:12px 14px; }
+
+  .dz { padding:18px 12px; }
+  .kv { flex-direction:column; gap:2px; }
+  .kv .k { min-width:auto; font-size:10px; }
+  .kv .v { font-size:9px; }
+
+  .res .m span { display:block; margin-right:0; margin-bottom:1px; }
+
+  .opts { flex-direction:column; align-items:stretch; gap:8px; }
+  .opts select { max-width:100%; width:100%; }
+
+  .fbr { padding:5px 8px; gap:4px; }
+  .fbr .fn { font-size:10px; }
+  .fbr .fs { font-size:9px; }
+
+  .insp-h { padding:8px 10px; }
+  .insp-b { padding:10px; }
+
+  .sender-type-row { flex-direction:column; gap:4px; }
+
+  .recipient-item { flex-wrap:wrap; gap:4px; padding:6px 8px; }
+  .recipient-item .r-value { font-size:9px; }
+}
+
+@media(max-width:440px) {
+  .nav { grid-template-columns:repeat(2,1fr); }
+  .header h1 { font-size:16px; }
+  .leak-tbl { font-size:9px; }
+  .leak-tbl td { padding:3px 4px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ===================== Header ===================== -->
+<div class="header">
+  <h1>CEF <em>Post-Quantum Secure File Exchange</em></h1>
+  <p>Encrypt files for specific recipients using ML-KEM-768, sign with ML-DSA-65,
+     and package them into a portable container. Everything runs in your browser.</p>
+</div>
+
+<div class="wrap">
+  <!-- ===================== Intro ===================== -->
+  <div class="intro">
+    <div class="intro-card">
+      <h3>What is CEF?</h3>
+      <p style="font-size:12px;color:var(--ink-2);line-height:1.6">
+        CEF (COSE Encrypted Files) is a secure file exchange format. It packages files
+        into a ZIP container where the manifest and each file are individually encrypted
+        with AES-256-GCM. Keys are wrapped using ML-KEM-768 (post-quantum), and the
+        manifest is signed with ML-DSA-65. Without a recipient's private key, file names,
+        types, and metadata are inaccessible.
+      </p>
+    </div>
+    <div class="intro-card">
+      <h3>Container structure</h3>
+      <div class="tree">
+        <div><span class="dir">container.cef</span> <span class="note">(ZIP archive)</span></div>
+        <div>&nbsp;&nbsp;<span class="dir">META-INF/</span></div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="meta">manifest.cbor.cose</span> <span class="note">encrypted manifest (COSE_Encrypt)</span></div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="meta">manifest.cose-sign1</span> <span class="note">ML-DSA-65 signature</span></div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="meta">manifest.tst</span> <span class="note">RFC 3161 timestamp</span></div>
+        <div>&nbsp;&nbsp;<span class="dir">encrypted/</span></div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="enc">&lt;random&gt;.cose</span> <span class="note">AES-256-GCM per file</span></div>
+      </div>
+      <table class="leak-tbl">
+        <thead><tr><th></th><th>Exposed</th><th>Protected</th></tr></thead>
+        <tbody>
+          <tr><td class="lbl">Files</td>     <td class="exp">Count, approx. sizes</td>      <td class="prt">Names, types, content</td></tr>
+          <tr><td class="lbl">Sender</td>    <td class="exp">Signing key ID</td>             <td class="prt">Name, email</td></tr>
+          <tr><td class="lbl">Recipients</td><td class="exp">Key IDs, wrap algorithm</td>    <td class="prt">Names, emails, identities</td></tr>
+          <tr><td class="lbl">Crypto</td>    <td class="exp">AES-256-GCM, ML-KEM-768</td>    <td class="prt">Keys, plaintext</td></tr>
+          <tr><td class="lbl">Timestamp</td> <td class="exp">TSA, time, policy</td>          <td class="prt">(public by design)</td></tr>
+        </tbody>
+      </table>
+      <div style="font-size:9px;color:var(--ink-4);margin-top:6px">Try the demo below to see real structure and decrypted content.</div>
+    </div>
+  </div>
+
+  <!-- ===================== Nav Links ===================== -->
+  <div class="nav">
+    <a href="https://github.com/PeculiarVentures/cef"><span class="ic">&#128193;</span><span class="lb">Source</span><span class="ds">GitHub repository</span></a>
+    <a href="https://github.com/PeculiarVentures/cef/blob/main/spec/SPECIFICATION.md"><span class="ic">&#128220;</span><span class="lb">Specification</span><span class="ds">Wire format, CDDL, algorithms</span></a>
+    <a href="https://github.com/PeculiarVentures/cef/blob/main/spec/SECURITY.md"><span class="ic">&#128737;</span><span class="lb">Threat Model</span><span class="ds">Assets, adversaries, limitations</span></a>
+    <a href="https://github.com/PeculiarVentures/cef/tree/main/sdk/go"><span class="ic">&#9881;</span><span class="lb">Go SDK</span><span class="ds">Reference implementation</span></a>
+    <a href="https://github.com/PeculiarVentures/cef/tree/main/sdk/typescript"><span class="ic">&#9998;</span><span class="lb">TypeScript SDK</span><span class="ds">Browser &amp; Node.js</span></a>
+    <a href="https://github.com/PeculiarVentures/cef/blob/main/spec/IMPLEMENTING-A-BACKEND.md"><span class="ic">&#128268;</span><span class="lb">Backend Guide</span><span class="ds">Implement your own provider</span></a>
+  </div>
+
+  <!-- ===================== Sender Identity ===================== -->
+  <div class="keys" id="sender-section">
+    <h3>Sender Identity</h3>
+    <p style="font-size:11px;color:var(--ink-3);margin-bottom:8px;line-height:1.5">
+      The sender signs the container with ML-DSA-65 (FIPS 204). Recipients verify
+      this signature to confirm the container hasn't been tampered with.
+    </p>
+    <div id="sender-loading" style="font-size:11px;color:var(--ink-4)">Generating ML-DSA-65 key pair...</div>
+    <div id="sender-display" style="display:none">
+      <div class="kr"><label>Type</label><code id="sender-type-display">...</code></div>
+      <div class="kr"><label>Kid</label><code id="sender-kid-display">...</code></div>
+      <div class="kr"><label>Algorithm</label><code>ML-DSA-65 (FIPS 204, post-quantum)</code></div>
+      <div class="kr"><label>Public Key</label><code id="sender-pk-display">...</code></div>
+      <div id="sender-cert-toggle" style="display:none;margin-top:6px">
+        <button class="btn-small" onclick="toggleSenderCert()">View Certificate</button>
+      </div>
+      <div id="sender-cert-viewer" style="display:none;margin-top:8px"></div>
+      <div style="margin-top:8px">
+        <div class="sender-type-row">
+          <select id="sender-type" onchange="regenerateSender()">
+            <option value="certificate" selected>Certificate</option>
+            <option value="key">Key ID</option>
+          </select>
+          <button class="btn-small" onclick="regenerateSender()">Regenerate</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== Step 2 & 3: Panels ===================== -->
+  <div class="panels">
+    <!-- Encrypt -->
+    <div class="panel" id="encrypt-panel">
+      <div class="panel-hd"><h2>Encrypt &amp; Sign</h2></div>
+      <div class="panel-bd">
+        <div class="gate">Generating sender identity...</div>
+        <p style="font-size:10px;color:var(--ink-3);margin-bottom:10px;line-height:1.5">
+          Files are encrypted with AES-256-GCM. Each recipient gets a separate key wrap
+          using ML-KEM-768. File names are randomized — originals are in the encrypted manifest.
+        </p>
+
+        <!-- File selection -->
+        <div class="dz" id="enc-dz" onclick="document.getElementById('enc-fi').click()"><div class="icon">&#128196;</div><p>Drop files or <b>browse</b></p></div>
+        <input type="file" id="enc-fi" multiple hidden onchange="addFiles(this.files)">
+        <button class="btn-sample" onclick="addSample()">+ Add another sample file</button>
+        <div id="enc-list"></div>
+
+        <!-- Recipients -->
+        <div class="recipients-section">
+          <div class="section-label">Recipients</div>
+          <div id="recipient-list"></div>
+          <div class="add-recipient-row">
+            <select id="recipient-type">
+              <option value="certificate" selected>Certificate</option>
+              <option value="key">Key</option>
+            </select>
+            <button class="btn-small" onclick="addRecipient()">+ Add Recipient</button>
+          </div>
+        </div>
+
+        <!-- Options -->
+        <div class="opts">
+          <label><input type="checkbox" id="chk-ts" checked> RFC 3161 timestamp</label>
+          <select id="tsa-sel"></select>
+        </div>
+        <button class="btn btn-p" id="btn-enc" disabled onclick="doEncrypt()">Encrypt &amp; Sign</button>
+        <div id="enc-res"></div>
+      </div>
+    </div>
+
+    <!-- Decrypt / Inspect -->
+    <div class="panel" id="decrypt-panel">
+      <div class="panel-hd"><h2>Open Container</h2><span class="badge badge-ok">Decrypt + Verify</span></div>
+      <div class="panel-bd">
+        <div class="gate">Drop a .cef container or encrypt files first</div>
+        <p style="font-size:10px;color:var(--ink-3);margin-bottom:10px;line-height:1.5">
+          The selected recipient's ML-KEM-768 key unwraps the content encryption key.
+          The sender's ML-DSA-65 signature is verified. File hashes are checked.
+        </p>
+        <div class="dz" id="dec-dz" onclick="document.getElementById('dec-fi').click()"><div class="icon">&#128274;</div><p>Drop a <b>.cef container</b> to open</p></div>
+        <input type="file" id="dec-fi" accept=".cef" hidden onchange="loadContainer(this.files)">
+        <div id="dec-info"></div>
+        <button class="btn btn-g" id="btn-dec" disabled onclick="doDecrypt()">Decrypt &amp; Verify</button>
+        <div id="dec-res"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <a href="https://github.com/PeculiarVentures/cef">github.com/PeculiarVentures/cef</a> &middot;
+  AES-256-GCM &middot; ML-KEM-768 (FIPS 203) &middot; ML-DSA-65 (FIPS 204) &middot;
+  COSE/CBOR &middot; All crypto in-browser
+</div>
+
+<!-- =====================================================================
+     Application Logic
+     ===================================================================== -->
+<script type="module">
+
+// ---------------------------------------------------------------------------
+// Imports
+// ---------------------------------------------------------------------------
+
+import {
+  encrypt, decrypt,                            // Workflow API
+  readContainer, unmarshalEncrypt, unmarshalSign1, // Container inspection
+  toHex, randomBytes,                          // Utilities
+  HeaderAlgorithm, HeaderKeyID, HeaderIV,      // COSE header labels
+} from './cef-sdk.js';
+
+import {
+  mlkemKeygen,                                 // ML-KEM-768 key generation
+  mldsaKeygen,                                 // ML-DSA-65 key generation
+  mldsaSignRaw,                                // Raw ML-DSA sign (for cert generation)
+} from './cef-pq.js';
+
+import {
+  buildTimestampRequest, parseTimestampResponse, parseTSTInfo,
+  extractTimestampCertificates,                // Extract certs from TSA response
+} from './cef-timestamp.js';
+
+import {
+  createSelfSignedMLDSACert,                   // Generate self-signed ML-DSA-65 cert
+} from './cef-cert.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Human-readable names for COSE algorithm identifiers */
+const ALG_NAMES = {
+  3: 'AES-256-GCM', [-5]: 'AES-256-KW', [-7]: 'ES256',
+  [-16]: 'SHA-256', [-43]: 'SHA-384', [-44]: 'SHA-512',
+  [-48]: 'ML-DSA-44', [-49]: 'ML-DSA-65', [-50]: 'ML-DSA-87',
+  [-70010]: 'ML-KEM-768+A256KW',
+};
+
+/** RFC 3161 timestamp servers available via the rfc3161.ai.moda CORS proxy */
+const TSA_SERVERS = [
+  { name: 'DigiCert',   url: 'https://rfc3161.ai.moda/digicert',   trust: 'Adobe, Windows' },
+  { name: 'Sectigo',    url: 'https://rfc3161.ai.moda/sectigo',    trust: 'Adobe, Windows' },
+  { name: 'GlobalSign', url: 'https://rfc3161.ai.moda/globalsign', trust: 'Adobe, Windows' },
+  { name: 'FreeTSA',    url: 'https://rfc3161.ai.moda/freetsa',    trust: 'Community' },
+];
+
+// ---------------------------------------------------------------------------
+// Application State
+// ---------------------------------------------------------------------------
+
+/** Sender identity (ML-DSA-65 signing key). */
+let sender = null; // { type, kid, dsaKeys, claims }
+
+/** Recipients, each with their own ML-KEM-768 key pair. */
+let recipients = []; // [{ type, kid, kemKeys, claims }]
+
+/** Which recipient index to use for decryption. */
+let decryptRecipientIdx = 0;
+
+let files   = [];          // Files to encrypt: [{ name, data: Uint8Array }]
+let cefData = null;        // Loaded .cef container bytes
+let blobURLs = [];         // Track created blob URLs for cleanup
+
+/** Sample file templates for variety. */
+const SAMPLE_FILES = [
+  { name: 'quarterly-report.txt', content: () => `Quarterly Report - ${new Date().toLocaleDateString()}\n\nThis is a sample quarterly report encrypted with CEF.\nAll file names, sender identity, and metadata are protected\ninside the encrypted manifest.` },
+  { name: 'board-minutes.txt', content: () => `Board Meeting Minutes - ${new Date().toISOString().split('T')[0]}\n\nAttendees: [encrypted]\nDecisions: [encrypted]\n\nThis document is protected by post-quantum encryption.\nOnly authorized recipients can read the contents.` },
+  { name: 'contract-draft.txt', content: () => `DRAFT CONTRACT\nDate: ${new Date().toLocaleDateString()}\nRef: CEF-${Math.random().toString(36).substring(2, 8).toUpperCase()}\n\nThis draft contract is encrypted for specific recipients.\nThe container signature proves it has not been tampered with\nsince the sender signed it with ML-DSA-65.` },
+  { name: 'api-keys.txt', content: () => `API Credentials (CONFIDENTIAL)\nGenerated: ${new Date().toISOString()}\n\nThese credentials are encrypted with AES-256-GCM and wrapped\nwith ML-KEM-768. Only the intended recipient can unwrap the\ncontent encryption key and access this file.` },
+  { name: 'patient-records.txt', content: () => `Patient Record Summary\nDate: ${new Date().toLocaleDateString()}\nID: ${Math.random().toString(36).substring(2, 10)}\n\nThis record is protected under regulatory requirements.\nThe RFC 3161 timestamp proves when this container was created.\nThe ML-DSA-65 signature proves the sender's identity.` },
+];
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Shorthand for document.getElementById. */
+const $ = id => document.getElementById(id);
+
+/** HTML-escape a string to prevent XSS in innerHTML. */
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+/** Look up human-readable name for a COSE algorithm identifier. */
+function algName(id) {
+  return ALG_NAMES[id] || `alg(${id})`;
+}
+
+/** Format byte count as human-readable size (B / KB / MB). */
+function formatSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(1) + ' MB';
+}
+
+/** Decode a COSE key ID (Uint8Array or string) to display string. */
+function decodeKid(v) {
+  if (v instanceof Uint8Array) return new TextDecoder().decode(v);
+  return typeof v === 'string' ? v : '(none)';
+}
+
+/** Coerce a value to Uint8Array (handles CBOR decode variants). */
+function asBytes(v) {
+  return v instanceof Uint8Array ? v : new Uint8Array(v || []);
+}
+
+// ---------------------------------------------------------------------------
+// Panel Gating: lock/unlock panels based on prerequisites
+// ---------------------------------------------------------------------------
+
+function lock(id)   { $(id).classList.add('locked'); }
+function unlock(id) { $(id).classList.remove('locked'); }
+
+lock('encrypt-panel'); // Locked until sender is generated
+
+// ---------------------------------------------------------------------------
+// Sender Identity
+//
+// Auto-generated on page load (certificate type by default).
+// Can be regenerated with a different type via the dropdown.
+// Certificate viewer is collapsed behind a "View Certificate" toggle.
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate (or regenerate) the sender identity.
+ * @param {string} type - 'certificate' or 'key'
+ */
+function buildSender(type) {
+  const dsaKeys = mldsaKeygen();
+  const kid = toHex(randomBytes(8));
+
+  // Generate self-signed ML-DSA-65 certificate if certificate type
+  let certBase64 = null;
+  if (type === 'certificate') {
+    try {
+      certBase64 = createSelfSignedMLDSACert(
+        dsaKeys.publicKey,
+        mldsaSignRaw(dsaKeys.secretKey),
+        'Demo Sender',
+      );
+    } catch (e) {
+      console.warn('Cert generation failed:', e);
+    }
+  }
+
+  // x5c and claims are mutually exclusive (spec §5.5):
+  // certificate → identity from cert subject; key → claims for UI hints
+  sender = {
+    type, kid, dsaKeys, certBase64,
+    claims: certBase64 ? undefined : { email: 'demo@cef.dev', name: 'Demo Sender' },
+  };
+
+  // Update display
+  $('sender-type-display').textContent = type === 'certificate' ? 'Self-Signed Certificate' : 'Key ID';
+  $('sender-kid-display').textContent = kid;
+  $('sender-pk-display').textContent = toHex(dsaKeys.publicKey).substring(0, 32) + '... (' + dsaKeys.publicKey.length + ' B)';
+  $('sender-loading').style.display = 'none';
+  $('sender-display').style.display = 'block';
+
+  // Show/hide the "View Certificate" toggle
+  $('sender-cert-toggle').style.display = certBase64 ? 'block' : 'none';
+  $('sender-cert-viewer').style.display = 'none';
+  $('sender-cert-viewer').innerHTML = '';
+
+  // Auto-add a first recipient if none exist
+  if (recipients.length === 0) {
+    addRecipientOfType('certificate');
+  }
+
+  unlock('encrypt-panel');
+  renderRecipients();
+  updateEncBtn();
+}
+
+/** Toggle the PV certificate viewer for the sender cert. */
+window.toggleSenderCert = function() {
+  const viewer = $('sender-cert-viewer');
+  if (viewer.style.display === 'none') {
+    viewer.style.display = 'block';
+    if (!viewer.hasChildNodes() && sender?.certBase64) {
+      const el = document.createElement('peculiar-certificate-viewer');
+      el.setAttribute('certificate', sender.certBase64);
+      el.setAttribute('download', '');
+      viewer.appendChild(el);
+    }
+  } else {
+    viewer.style.display = 'none';
+  }
+};
+
+/** Regenerate sender with the currently selected type. */
+window.regenerateSender = function() {
+  buildSender($('sender-type').value);
+};
+
+// Auto-generate sender on page load (certificate type default).
+// Also add a sample file so the demo is ready to encrypt immediately.
+setTimeout(() => {
+  buildSender('certificate');
+  addSample();
+}, 100);
+
+// ---------------------------------------------------------------------------
+// Recipient Management
+//
+// Each recipient gets their own ML-KEM-768 key pair and a unique name.
+// Certificate-type recipients also get a self-signed ML-KEM cert
+// (note: ML-KEM is for key encapsulation, not signing — the cert here
+// binds the KEM public key to a name for demonstration purposes).
+// ---------------------------------------------------------------------------
+
+/** Names assigned to recipients in order. */
+const RECIPIENT_NAMES = ['Bob', 'Carol', 'Dave', 'Eve', 'Frank', 'Grace', 'Heidi', 'Ivan'];
+
+/**
+ * Add a new recipient with a fresh ML-KEM-768 key pair.
+ * Certificate recipients also get a self-signed cert displayed via PV viewer.
+ *
+ * @param {'key'|'certificate'} type - Recipient type
+ */
+function addRecipientOfType(type) {
+  const kemKeys = mlkemKeygen();
+  const name = RECIPIENT_NAMES[recipients.length] || `Recipient-${recipients.length + 1}`;
+  const kid = toHex(randomBytes(8));
+
+  // For certificate recipients, generate a self-signed cert binding
+  // the ML-KEM public key to the recipient name. We reuse the ML-DSA
+  // cert generator (the cert viewer will show the key details).
+  let certBase64 = null;
+  if (type === 'certificate') {
+    try {
+      // Generate a temporary ML-DSA key just for signing the cert
+      const certDsaKeys = mldsaKeygen();
+      certBase64 = createSelfSignedMLDSACert(
+        certDsaKeys.publicKey,
+        mldsaSignRaw(certDsaKeys.secretKey),
+        name,
+      );
+    } catch (e) {
+      console.warn(`Cert generation for ${name} failed:`, e);
+    }
+  }
+
+  recipients.push({ type, kid, name, kemKeys, certBase64 });
+  renderRecipients();
+  updateEncBtn();
+}
+
+/** Render the recipient list with type badges, names, and cert viewers. */
+function renderRecipients() {
+  const el = $('recipient-list');
+  if (!el) return;
+
+  let html = '';
+  recipients.forEach((r, i) => {
+    const typeClass = r.type === 'certificate' ? 'r-type-cert' : 'r-type-key';
+    const typeLabel = r.type === 'certificate' ? 'cert' : 'key';
+    const isActive = i === decryptRecipientIdx;
+    const decryptBadge = isActive ? ' <span class="r-self">&#128275; decrypt</span>' : '';
+    const removeBtn = recipients.length > 1
+      ? `<button class="remove" onclick="event.stopPropagation();removeRecipient(${i})">&times;</button>`
+      : '';
+
+    html += `
+      <div class="recipient-item${isActive ? ' active' : ''}" onclick="selectDecryptRecipient(${i})">
+        <span class="r-type ${typeClass}">${typeLabel}</span>
+        <span class="r-value"><b>${esc(r.name)}</b> &middot; ${esc(r.kid)}</span>
+        <span class="r-self">ML-KEM-768</span>${decryptBadge}
+        ${removeBtn}
+      </div>`;
+
+    // Certificate toggle (collapsed by default)
+    if (r.certBase64) {
+      html += `<div style="margin:2px 0 4px 0">
+        <button class="btn-small" onclick="event.stopPropagation();toggleRecipientCert(${i})">View Certificate</button>
+        <div class="recipient-cert-slot" data-recipient-index="${i}" style="display:none;margin-top:4px"></div>
+      </div>`;
+    }
+  });
+
+  if (recipients.length === 0) {
+    html = '<div class="recipient-note">No recipients yet. Add one to encrypt.</div>';
+  }
+
+  el.innerHTML = html;
+}
+
+/** Add a recipient of the type selected in the dropdown. */
+window.addRecipient = function() {
+  addRecipientOfType($('recipient-type').value);
+};
+
+/** Remove a recipient by index. Adjusts decrypt selection if needed. */
+window.removeRecipient = function(i) {
+  recipients.splice(i, 1);
+  if (decryptRecipientIdx >= recipients.length) {
+    decryptRecipientIdx = Math.max(0, recipients.length - 1);
+  }
+  renderRecipients();
+  updateEncBtn();
+};
+
+/** Select which recipient's key to use for decryption. */
+window.selectDecryptRecipient = function(i) {
+  decryptRecipientIdx = i;
+  renderRecipients();
+};
+
+/** Toggle the PV certificate viewer for a recipient. */
+window.toggleRecipientCert = function(i) {
+  const slot = document.querySelector(`.recipient-cert-slot[data-recipient-index="${i}"]`);
+  if (!slot) return;
+  if (slot.style.display === 'none') {
+    slot.style.display = 'block';
+    if (!slot.hasChildNodes() && recipients[i]?.certBase64) {
+      const el = document.createElement('peculiar-certificate-viewer');
+      el.setAttribute('certificate', recipients[i].certBase64);
+      el.setAttribute('download', '');
+      slot.appendChild(el);
+    }
+  } else {
+    slot.style.display = 'none';
+  }
+};
+
+/** Toggle the PV certificate viewer for a TSA cert in the timestamp section. */
+window.toggleTsaCert = function(i) {
+  const slot = document.querySelector(`.cert-slot[data-cert-index="${i}"]`);
+  if (!slot) return;
+  if (slot.style.display === 'none') {
+    slot.style.display = 'block';
+    if (!slot.hasChildNodes() && window._tsaCerts?.[i]) {
+      const el = document.createElement('peculiar-certificate-viewer');
+      el.setAttribute('certificate', window._tsaCerts[i]);
+      el.setAttribute('download', '');
+      slot.appendChild(el);
+    }
+  } else {
+    slot.style.display = 'none';
+  }
+};
+
+/** Toggle the PV certificate viewer for the sender cert in the decrypt result. */
+window.toggleDecryptedSenderCert = function() {
+  // There may be two slots: one in the summary, one in the signature section
+  const slots = [
+    $('decrypted-sender-cert-slot'),
+    $('sig-sender-cert-slot'),
+  ].filter(Boolean);
+
+  for (const slot of slots) {
+    if (slot.style.display === 'none') {
+      slot.style.display = 'block';
+      if (!slot.hasChildNodes() && window._decryptedSenderCert) {
+        const el = document.createElement('peculiar-certificate-viewer');
+        el.setAttribute('certificate', window._decryptedSenderCert);
+        el.setAttribute('download', '');
+        slot.appendChild(el);
+      }
+    } else {
+      slot.style.display = 'none';
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Step 2: Encrypt
+// ---------------------------------------------------------------------------
+
+function updateEncBtn() {
+  $('btn-enc').disabled = !sender || recipients.length === 0 || files.length === 0;
+}
+
+function renderFiles() {
+  $('enc-list').innerHTML = files.map((f, i) =>
+    `<div class="fi">
+      <span class="n">${esc(f.name)}</span>
+      <span class="sz">${formatSize(f.data.length)}</span>
+      <button class="rm" onclick="removeFile(${i})">&times;</button>
+    </div>`
+  ).join('');
+  updateEncBtn();
+}
+
+window.addFiles = function(list) {
+  for (const f of list) {
+    const r = new FileReader();
+    r.onload = () => {
+      files.push({ name: f.name, data: new Uint8Array(r.result) });
+      renderFiles();
+    };
+    r.readAsArrayBuffer(f);
+  }
+};
+
+window.removeFile = function(i) {
+  files.splice(i, 1);
+  renderFiles();
+};
+
+window.addSample = function() {
+  // Pick a random sample file each time for variety.
+  const sample = SAMPLE_FILES[Math.floor(Math.random() * SAMPLE_FILES.length)];
+  files.push({ name: sample.name, data: new TextEncoder().encode(sample.content()) });
+  renderFiles();
+};
+
+
+window.doEncrypt = async function() {
+  if (!sender || recipients.length === 0 || !files.length) return;
+  const btn = $('btn-enc'), res = $('enc-res');
+  btn.innerHTML = '<span class="spin"></span> Encrypting...';
+  btn.disabled = true;
+
+  try {
+    const t0 = performance.now();
+
+    // Optional: request a real RFC 3161 timestamp from a TSA.
+    // The preimage is a SHA-256 digest of a random nonce — no file metadata
+    // is sent to the TSA. In production, timestamp the COSE_Sign1 signature
+    // bytes after signing for a cryptographic binding to the container.
+    let timestamp, tsaName;
+    if ($('chk-ts').checked && $('tsa-sel').value !== '') {
+      const tsa = TSA_SERVERS[parseInt($('tsa-sel').value)];
+      tsaName = tsa.name;
+      btn.innerHTML = `<span class="spin"></span> Timestamping (${tsa.name})...`;
+
+      // Hash a random nonce — TSA sees only the digest, not file metadata
+      const nonce = randomBytes(32);
+      const preimageHash = new Uint8Array(await crypto.subtle.digest('SHA-256', nonce));
+      const tsReq = await buildTimestampRequest(preimageHash);
+      const tsResp = await fetch(tsa.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/timestamp-query' },
+        body: tsReq,
+      });
+      if (!tsResp.ok) throw new Error(`TSA ${tsa.name}: ${tsResp.status}`);
+      timestamp = new Uint8Array(await tsResp.arrayBuffer());
+      parseTimestampResponse(timestamp);
+      btn.innerHTML = '<span class="spin"></span> Encrypting...';
+    }
+
+    // Workflow API: encrypt files with sender identity and recipients.
+    const senderX5c = sender.certBase64
+      ? [Uint8Array.from(atob(sender.certBase64), c => c.charCodeAt(0))]
+      : undefined;
+
+    const result = await encrypt({
+      files: files.map(f => ({ name: f.name, data: f.data })),
+      sender: {
+        signingKey: sender.dsaKeys.secretKey,
+        kid: sender.kid,
+        x5c: senderX5c,
+        claims: sender.claims,
+      },
+      recipients: recipients.map(r => ({
+        kid: r.kid,
+        encryptionKey: r.kemKeys.publicKey,
+        kind: r.type,
+      })),
+      timestamp,
+    });
+
+    const ms = ((performance.now() - t0) / 1000).toFixed(2);
+    const inputSize = files.reduce((sum, f) => sum + f.data.length, 0);
+    const ratio = inputSize > 0 ? ((result.container.length / inputSize) * 100).toFixed(0) : '—';
+    const blob = new Blob([result.container], { type: 'application/octet-stream' });
+    // Revoke previous blob URLs to prevent memory leaks
+    blobURLs.forEach(u => URL.revokeObjectURL(u));
+    blobURLs = [];
+    const url = URL.createObjectURL(blob);
+    blobURLs.push(url);
+
+    res.innerHTML = `<div class="res ok">
+      Encrypted ${result.fileCount} file${result.fileCount > 1 ? 's' : ''} in ${ms}s
+      <div class="m">
+        <span>Input: ${formatSize(inputSize)}</span>
+        <span>Container: ${formatSize(result.container.length)} (${ratio}%)</span>
+        <span>Encryption: AES-256-GCM</span>
+        <span>Key wrap: ML-KEM-768</span>
+        <span>Signature: ML-DSA-65</span>
+        <span>Recipients: ${recipients.length}</span>
+        ${tsaName ? `<span>Timestamp: ${tsaName} (RFC 3161, RSA/ECDSA)</span>` : ''}
+      </div>
+      <a class="dlk" href="${url}" download="encrypted.cef">&#11015; Download encrypted.cef</a>
+    </div>`;
+
+    // Auto-load into decrypt panel and trigger decryption
+    cefData = result.container;
+    unlock('decrypt-panel');
+    $('btn-dec').disabled = false;
+    $('dec-info').innerHTML = `<div class="res inf" style="margin-top:8px">Container from encrypt loaded (${formatSize(cefData.length)})</div>`;
+    setTimeout(() => doDecrypt(), 100);
+
+  } catch (e) {
+    res.innerHTML = `<div class="res err">${esc(e.message)}</div>`;
+  }
+  btn.innerHTML = 'Encrypt &amp; Sign';
+  btn.disabled = false;
+};
+
+// ---------------------------------------------------------------------------
+// Step 3: Load Container
+// ---------------------------------------------------------------------------
+
+window.loadContainer = function(list) {
+  if (!list.length) return;
+  const f = list[0], r = new FileReader();
+  r.onload = () => {
+    cefData = new Uint8Array(r.result);
+    unlock('decrypt-panel');
+    $('dec-info').innerHTML = `<div class="res inf" style="margin-top:8px">${esc(f.name)} (${formatSize(cefData.length)})</div>`;
+    $('btn-dec').disabled = recipients.length === 0;
+  };
+  r.readAsArrayBuffer(f);
+};
+
+// ---------------------------------------------------------------------------
+// Step 4: Decrypt, Verify, Inspect
+// ---------------------------------------------------------------------------
+
+window.doDecrypt = async function() {
+  if (recipients.length === 0 || !cefData) return;
+  const btn = $('btn-dec'), res = $('dec-res');
+  btn.innerHTML = '<span class="spin"></span> Decrypting...';
+  btn.disabled = true;
+
+  // Revoke previous decrypt blob URLs
+  blobURLs.forEach(u => URL.revokeObjectURL(u));
+  blobURLs = [];
+
+  // Use the selected recipient's key pair for decryption
+  const decRecipient = recipients[decryptRecipientIdx] || recipients[0];
+
+  try {
+    const t0 = performance.now();
+    const container = readContainer(cefData);
+
+    // Workflow API: decrypt with recipient key and verify sender.
+    const result = await decrypt(cefData, {
+      recipient: {
+        kid: decRecipient.kid,
+        decryptionKey: decRecipient.kemKeys.secretKey,
+      },
+      verify: sender ? sender.dsaKeys.publicKey : false,
+    });
+
+    const ms = ((performance.now() - t0) / 1000).toFixed(2);
+
+    // Build decrypted files browser
+    let fhtml = `<div class="fb"><div class="fb-hd">Decrypted Files</div>`;
+    for (const f of result.files) {
+      const blob = new Blob([f.data]);
+      const url = URL.createObjectURL(blob);
+      blobURLs.push(url);
+      fhtml += `<div class="fbr">
+        <span class="icon">&#128196;</span>
+        <span class="fn">${esc(f.originalName)}</span>
+        <span class="fs">${formatSize(f.size)}</span>
+        <span class="tg ok">SHA-256 OK</span>
+        <a class="dl" href="${url}" download="${esc(f.originalName)}">&#11015;</a>
+      </div>`;
+    }
+    fhtml += '</div>';
+
+    // Build inspection
+    const ihtml = buildInspection(container, result);
+
+    // Extract summary info from the COSE structures
+    let encAlg = '', wrapAlg = '', sigAlg = '', recipientCount = 0;
+    try {
+      const enc = unmarshalEncrypt(container.encryptedManifest);
+      encAlg = algName(enc.protected.get(HeaderAlgorithm));
+      recipientCount = enc.recipients.length;
+      if (enc.recipients.length > 0) {
+        wrapAlg = algName(enc.recipients[0].protected.get(HeaderAlgorithm));
+      }
+    } catch {}
+    try {
+      if (container.manifestSignature) {
+        const sig = unmarshalSign1(container.manifestSignature);
+        sigAlg = algName(sig.protected.get(HeaderAlgorithm));
+      }
+    } catch {}
+
+    // Determine sender identity type from decrypt result
+    const senderHasCert = result.sender.x5c && result.sender.x5c.length > 0;
+    const senderTypeLabel = senderHasCert ? 'certificate' : 'key';
+
+    // Store sender cert for the viewer toggle
+    if (senderHasCert) {
+      window._decryptedSenderCert = btoa(String.fromCharCode(...result.sender.x5c[0]));
+    } else {
+      window._decryptedSenderCert = null;
+    }
+
+    res.innerHTML = `
+      <div class="res ok">
+        Decrypted ${result.files.length} file${result.files.length > 1 ? 's' : ''} in ${ms}s
+        <div class="m">
+          <span>Encryption: ${encAlg}</span>
+          <span>Key wrap: ${wrapAlg}</span>
+          <span>Recipients: ${recipientCount}</span>
+          ${sigAlg ? `<span>Signature: ${sigAlg} (${result.signature})</span>` : ''}
+          <span>Sender: ${esc(result.sender.kid || '-')} (${senderTypeLabel})</span>
+          ${result.sender.claims?.email ? `<span>Email: ${esc(result.sender.claims.email)} (unverified)</span>` : ''}
+          ${container.timestamp ? '<span>Timestamp: RFC 3161 (RSA/ECDSA)</span>' : ''}
+        </div>
+        ${senderHasCert ? `<div style="margin-top:6px"><button class="btn-small" onclick="toggleDecryptedSenderCert()">View Sender Certificate</button><div id="decrypted-sender-cert-slot" style="display:none;margin-top:4px"></div></div>` : ''}
+      </div>
+      ${fhtml}${ihtml}`;
+  } catch (e) {
+    let ihtml = '';
+    try { ihtml = buildInspection(readContainer(cefData), null); } catch {}
+    res.innerHTML = `<div class="res err">${esc(e.message)}</div>${ihtml}`;
+  }
+
+  btn.innerHTML = 'Decrypt &amp; Verify';
+  btn.disabled = false;
+};
+
+// ---------------------------------------------------------------------------
+// Inspection Builder
+//
+// Generates the full inspection view after decryption. Shows:
+//   1. Container structure (ZIP file browser with name mappings)
+//   2. Decrypted manifest JSON
+//   3. COSE_Encrypt details (algorithm, IV, recipients)
+//   4. COSE_Sign1 details (algorithm, signer, validation status)
+//   5. Timestamp details (TSA, time, PQ warning, certificate chain)
+//
+// Each section is collapsible. Certificate chains are rendered using
+// the PV certificate viewer web component (inserted post-render).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the full inspection HTML for a decrypted container.
+ *
+ * @param {Container} c    - Parsed container from readContainer()
+ * @param {DecryptResult|null} dec - Decrypt result, or null if decrypt failed
+ * @returns {string} HTML string for innerHTML
+ */
+
+function buildInspection(c, dec) {
+  let h = '';
+
+  // Map randomized names to originals (if decrypted)
+  const nameMap = new Map();
+  if (dec?.files) {
+    const names = [...c.encryptedFiles.keys()];
+    dec.files.forEach((f, i) => { if (i < names.length) nameMap.set(names[i], f.originalName); });
+  }
+
+  // Container structure
+  h += `<div class="fb" style="margin-top:12px"><div class="fb-hd">Container Structure</div>`;
+  h += dirRow('META-INF/');
+  h += fRow('&#128203;', 'manifest.cbor.cose', c.encryptedManifest?.length, 'COSE_Encrypt');
+  if (c.manifestSignature) h += fRow('&#128395;', 'manifest.cose-sign1', c.manifestSignature.length, 'COSE_Sign1');
+  if (c.timestamp) h += fRow('&#128344;', 'manifest.tst', c.timestamp.length, 'RFC 3161');
+  h += dirRow(`encrypted/ (${c.encryptedFiles.size} file${c.encryptedFiles.size !== 1 ? 's' : ''})`);
+  for (const [name, data] of c.encryptedFiles) {
+    const orig = nameMap.get(name);
+    const label = orig
+      ? `${name.substring(0, 16)}... <span style="color:var(--green);font-size:9px">&rarr; ${esc(orig)}</span>`
+      : name;
+    h += `<div class="fbr"><span class="icon">&#128274;</span><span class="fn" style="padding-left:12px">${label}</span><span class="fs">${formatSize(data.length)}</span><span class="tg ok" style="font-size:8px">AES-256-GCM</span></div>`;
+  }
+  h += '</div>';
+
+  // Decrypted manifest display.
+  // Build a JSON representation from the DecryptResult fields.
+  if (dec) {
+    // Sender display (x5c/claims mutually exclusive)
+    const senderDisplay = { kid: dec.senderKid || '' };
+    if (dec.senderX5c?.length) {
+      senderDisplay.x5c = `[${dec.senderX5c.length} certificate${dec.senderX5c.length > 1 ? 's' : ''}]`;
+    } else if (dec.senderClaims) {
+      // Map JS-style property names to CBOR wire format names
+      const claims = {};
+      if (dec.senderClaims.email) claims.email = dec.senderClaims.email;
+      if (dec.senderClaims.name) claims.name = dec.senderClaims.name;
+      if (dec.senderClaims.createdAt) claims.created_at = dec.senderClaims.createdAt;
+      senderDisplay.claims = claims;
+    }
+
+    // Recipients from app state
+    const recipientsDisplay = recipients.map(r => {
+      const rec = { kid: r.kid, type: r.type || 'key' };
+      if (!r.certBase64 && r.name) rec.claims = { name: r.name };
+      return rec;
+    });
+
+    // Files with actual hashes
+    const filesDisplay = {};
+    const hashPromises = [];
+    for (const [en] of c.encryptedFiles) {
+      const orig = nameMap.get(en);
+      if (orig) {
+        const f = dec.files.find(x => x.originalName === orig);
+        filesDisplay[en] = {
+          original_name: orig,
+          hash_algorithm: -16,
+          hash: '(computing...)',
+          size: f?.size || 0,
+        };
+        if (f?.data) {
+          hashPromises.push(
+            crypto.subtle.digest('SHA-256', f.data).then(buf => {
+              filesDisplay[en].hash = toHex(new Uint8Array(buf));
+            })
+          );
+        }
+      }
+    }
+
+    const manifestDisplay = {
+      version: '0',
+      sender: senderDisplay,
+      recipients: recipientsDisplay,
+      files: filesDisplay,
+    };
+
+    const manifestPlaceholderId = 'manifest-json-' + Date.now();
+    h += section('Decrypted Manifest', true,
+      `<pre id="${manifestPlaceholderId}" style="margin:0;font-size:9px;line-height:1.5;background:var(--ink);color:#94a3b8;padding:10px;border-radius:6px;overflow-x:auto;white-space:pre-wrap">${esc(JSON.stringify(manifestDisplay, null, 2))}</pre>`);
+
+    // Update manifest display once hashes resolve
+    Promise.all(hashPromises).then(() => {
+      const el = document.getElementById(manifestPlaceholderId);
+      if (el) el.textContent = JSON.stringify(manifestDisplay, null, 2);
+    });
+  }
+
+  // COSE_Encrypt
+  try {
+    const enc = unmarshalEncrypt(c.encryptedManifest);
+    h += section('COSE_Encrypt Structure', true,
+      kv('Algorithm',  algName(enc.protected.get(HeaderAlgorithm))) +
+      kv('IV',         toHex(asBytes(enc.unprotected.get(HeaderIV)))) +
+      kv('Ciphertext', formatSize(enc.ciphertext.length)) +
+      kv('Recipients', '' + enc.recipients.length) +
+      enc.recipients.map((r, i) =>
+        kv(`Recipient ${i}`, `${algName(r.protected.get(HeaderAlgorithm))} &middot; kid: ${decodeKid(r.unprotected.get(HeaderKeyID))}`)
+      ).join('') +
+      kv('PQ Status', 'AES-256-GCM + ML-KEM-768 &mdash; quantum-resistant', 'ok'));
+  } catch (e) { h += `<div class="res err" style="margin-top:8px">Manifest: ${esc(e.message)}</div>`; }
+
+  // COSE_Sign1
+  if (c.manifestSignature) {
+    try {
+      const sig = unmarshalSign1(c.manifestSignature);
+      const ok = dec?.signature === 'valid';
+      const hasSenderCert = dec?.sender?.x5c && dec.sender.x5c.length > 0;
+      const identityType = hasSenderCert ? 'certificate (x5c)' : 'key ID';
+
+      let sigContent =
+        kv('Algorithm',    algName(sig.protected.get(HeaderAlgorithm))) +
+        kv('Signer kid',   decodeKid(sig.unprotected.get(HeaderKeyID))) +
+        kv('Identity',     identityType) +
+        (dec?.senderClaims?.email ? kv('Sender email', esc(dec.senderClaims.email) + ' <span style="color:var(--amber);font-size:9px">(unverified claim)</span>') : '') +
+        kv('Detached',     sig.payload === null ? 'yes' : 'no') +
+        kv('Signature',    sig.signature.length + ' bytes') +
+        (ok !== undefined ? kv('Status', ok ? 'Valid' : 'INVALID', ok ? 'ok' : 'bad') : '') +
+        kv('PQ Status', 'ML-DSA-65 (FIPS 204) &mdash; quantum-resistant', 'ok');
+
+      if (hasSenderCert) {
+        sigContent += `<div style="margin-top:6px">
+          <button class="btn-small" onclick="toggleDecryptedSenderCert()">View Sender Certificate</button>
+          <div id="sig-sender-cert-slot" style="display:none;margin-top:4px"></div>
+        </div>`;
+        // Store cert for this viewer too (reuses the same cert data)
+        window._decryptedSenderCert = btoa(String.fromCharCode(...dec.senderX5c[0]));
+      }
+
+      h += section('Signature (COSE_Sign1)', true, sigContent);
+    } catch (e) { h += `<div class="res err" style="margin-top:8px">Signature: ${esc(e.message)}</div>`; }
+  }
+
+  // Timestamp
+  if (c.timestamp) {
+    let tb = kv('Token size', c.timestamp.length + ' bytes');
+    try {
+      let tok;
+      try { tok = parseTimestampResponse(c.timestamp); } catch { tok = parseTSTInfo(c.timestamp); }
+      tb += kv('Status', 'Present', 'ok');
+      if (tok.genTime) tb += kv('Time', tok.genTime.toISOString());
+      if (tok.policy) tb += kv('Policy OID', tok.policy);
+
+      const certs = extractTimestampCertificates(c.timestamp);
+      tb += kv('PQ Status', 'RSA/ECDSA &mdash; not quantum-resistant (TSA uses classical crypto)', 'wrn');
+      if (certs.length > 0) {
+        tb += `<div style="margin-top:8px;font-size:10px;font-weight:600;color:var(--ink-3)">TSA Certificate Chain (${certs.length})</div>`;
+        for (let i = 0; i < certs.length; i++) {
+          tb += `<div style="margin-top:4px">
+            <button class="btn-small" onclick="toggleTsaCert(${i})">View Certificate ${i + 1}</button>
+            <div class="cert-slot" data-cert-index="${i}" style="display:none;margin-top:4px"></div>
+          </div>`;
+        }
+        window._tsaCerts = certs;
+      }
+    } catch (e) { tb += kv('Parse', 'Error: ' + e.message, 'wrn'); }
+    h += section('Timestamp (RFC 3161)', true, tb);
+  }
+
+  return h;
+}
+
+// ---------------------------------------------------------------------------
+// HTML Builders
+//
+// Small functions that generate HTML fragments for the inspection view.
+// Kept separate from the inspection logic for readability.
+// ---------------------------------------------------------------------------
+
+/** Directory row in the container structure file browser. */
+function dirRow(name) {
+  return `<div class="fbr dir"><span class="icon">&#128193;</span><span class="fn">${name}</span><span class="fs"></span></div>`;
+}
+
+/** File row in the container structure browser (icon, name, size, tag). */
+function fRow(icon, name, size, tag) {
+  return `<div class="fbr"><span class="icon">${icon}</span><span class="fn" style="padding-left:12px">${name}</span><span class="fs">${size ? formatSize(size) : ''}</span><span class="tg ok" style="font-size:8px">${tag}</span></div>`;
+}
+
+/**
+ * Collapsible inspection section.
+ * @param {string} title  - Section header text
+ * @param {boolean} open  - Whether to render expanded
+ * @param {string} body   - Inner HTML content
+ */
+function section(title, open, body) {
+  const c = open ? 'open' : '';
+  return `<div class="insp" style="margin-top:8px">
+    <div class="insp-h ${c}" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><span class="arr">&#9654;</span> ${title}</div>
+    <div class="insp-b ${c}">${body}</div>
+  </div>`;
+}
+
+/**
+ * Key-value row for inspection sections.
+ * @param {string} label - Left column label
+ * @param {string} value - Right column value (may contain HTML)
+ * @param {string} [cls] - Optional CSS class for the value ('ok', 'bad', 'wrn')
+ */
+function kv(label, value, cls) {
+  return `<div class="kv"><span class="k">${label}</span><span class="v${cls ? ' ' + cls : ''}">${value}</span></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Drag & Drop
+// ---------------------------------------------------------------------------
+
+/**
+ * Configure a dropzone element for drag-and-drop file handling.
+ * @param {string} id       - Element ID of the dropzone
+ * @param {Function} handler - Callback receiving the dropped FileList
+ */
+function setupDrop(id, handler) {
+  const z = $(id);
+  z.addEventListener('dragover', e => { e.preventDefault(); z.classList.add('over'); });
+  z.addEventListener('dragleave', () => z.classList.remove('over'));
+  z.addEventListener('drop', e => { e.preventDefault(); z.classList.remove('over'); handler(e.dataTransfer.files); });
+}
+
+setupDrop('enc-dz', f => addFiles(f));
+setupDrop('dec-dz', f => loadContainer(f));
+
+// ---------------------------------------------------------------------------
+// TSA Selector Initialization
+// ---------------------------------------------------------------------------
+
+/** Populate the TSA dropdown and wire up the timestamp checkbox toggle. */
+const tsaSelect = $('tsa-sel');
+TSA_SERVERS.forEach((s, i) => {
+  const o = document.createElement('option');
+  o.value = i;
+  o.textContent = `${s.name} (${s.trust})`;
+  tsaSelect.appendChild(o);
+});
+$('chk-ts').addEventListener('change', function() {
+  tsaSelect.style.display = this.checked ? 'inline-block' : 'none';
+});
+
+</script>
+</body>
+</html>

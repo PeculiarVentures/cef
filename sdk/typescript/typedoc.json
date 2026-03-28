@@ -1,0 +1,14 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts", "src/cef.ts", "src/format/index.ts"],
+  "out": "docs",
+  "name": "CEF TypeScript SDK",
+  "readme": "README.md",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "includeVersion": true,
+  "navigationLinks": {
+    "GitHub": "https://github.com/PeculiarVentures/cef",
+    "Demo": "https://cef.peculiarventures.com"
+  }
+}

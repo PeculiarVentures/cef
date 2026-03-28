@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+dist/
+
+# Build artifacts
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+sdk/go/cef
+
+# Internal review documents
+.reviews/
+
+# Generated API docs
+sdk/typescript/docs/
