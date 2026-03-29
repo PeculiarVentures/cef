@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 /**
- * Cross-SDK interop test.
+ * Cross-SDK interop test — all 12 directions across 4 SDKs.
  *
- * 1. TS encrypts → Go decrypts
- * 2. Go encrypts → TS decrypts
- * 3. Rust encrypts → TS decrypts
- * 4. TS encrypts → Rust decrypts
- * 5. Rust encrypts → Go decrypts
- * 6. Go encrypts → Rust decrypts
+ *  1. TS     encrypts → Go     decrypts
+ *  2. Go     encrypts → TS     decrypts
+ *  3. Rust   encrypts → TS     decrypts
+ *  4. TS     encrypts → Rust   decrypts
+ *  5. Rust   encrypts → Go     decrypts
+ *  6. Go     encrypts → Rust   decrypts
+ *  7. Python encrypts → TS     decrypts
+ *  8. TS     encrypts → Python decrypts
+ *  9. Python encrypts → Go     decrypts
+ * 10. Go     encrypts → Python decrypts
+ * 11. Python encrypts → Rust   decrypts
+ * 12. Rust   encrypts → Python decrypts
  *
  * Run: node test/interop.mjs
- * Requires: Go SDK built, TS SDK built, Rust SDK built
+ * Requires: Go, TS, Rust, Python SDKs built
  */
 
 import { execSync } from 'child_process';
@@ -375,6 +381,127 @@ func main() {
     process.exit(1);
   }
   console.log('   OK: ' + rustDecGoFiles[0].name + ': ' + rustDecGoText);
+
+  // --- Python interop ---
+  const pyBin = `python3 ${join(root, 'sdk/python/cef_interop.py')}`;
+  const pyDir = join(root, 'sdk/python');
+
+  // Generate Python keys
+  const pyKeys = execSync(`cd ${pyDir} && ${pyBin} keygen`, { encoding: 'utf-8' }).trim().split('\n');
+  const pyKemPk = pyKeys[0];
+  const pyKemSk = pyKeys[1];
+  const pyDsaPk = pyKeys[2];
+  const pyDsaSk = pyKeys[3];
+
+  // --- Test 7: Python encrypts → TS decrypts ---
+  console.log('7. Python encrypts → TS decrypts');
+  const tsRecipForPy = mlkemKeygen();
+  const tsRecipPkHexPy = Buffer.from(tsRecipForPy.publicKey).toString('hex');
+  const pyEncInput = JSON.stringify([{ name: 'greetings.txt', data: Buffer.from('hello from Python').toString('base64') }]);
+  const pyContainer = execSync(
+    `cd ${pyDir} && echo '${pyEncInput}' | ${pyBin} encrypt ${pyDsaSk} py-sender ${tsRecipPkHexPy} ts-recipient`,
+    { encoding: 'buffer' }
+  );
+  const tsDecPy = await decrypt(new Uint8Array(pyContainer), {
+    recipient: { kid: 'ts-recipient', decryptionKey: tsRecipForPy.secretKey },
+    verify: Buffer.from(pyDsaPk, 'hex'),
+  });
+  const pyText = new TextDecoder().decode(tsDecPy.files[0].data);
+  if (pyText !== 'hello from Python') { console.error('FAIL:', pyText); process.exit(1); }
+  console.log('   OK: ' + tsDecPy.files[0].originalName + ': ' + pyText);
+
+  // --- Test 8: TS encrypts → Python decrypts ---
+  console.log('8. TS encrypts → Python decrypts');
+  const tsSenderForPy = mldsaKeygen();
+  const tsResultForPy = await encrypt({
+    files: [{ name: 'hello.txt', data: new TextEncoder().encode('hello from TS to Python') }],
+    sender: { signingKey: tsSenderForPy.secretKey, kid: 'ts-sender' },
+    recipients: [{ kid: 'py-recipient', encryptionKey: Buffer.from(pyKemPk, 'hex') }],
+  });
+  writeFileSync(join(tmpDir, 'ts-for-py.cef'), tsResultForPy.container);
+  const tsSenderPkHexPy = Buffer.from(tsSenderForPy.publicKey).toString('hex');
+  const pyDecOutput = execSync(
+    `cd ${pyDir} && ${pyBin} decrypt ${pyKemSk} py-recipient ${tsSenderPkHexPy} < ${join(tmpDir, 'ts-for-py.cef')}`,
+    { encoding: 'utf-8' }
+  );
+  const pyDecFiles = JSON.parse(pyDecOutput);
+  const pyDecText = Buffer.from(pyDecFiles[0].data, 'base64').toString('utf-8');
+  if (pyDecText !== 'hello from TS to Python') { console.error('FAIL:', pyDecText); process.exit(1); }
+  console.log('   OK: ' + pyDecFiles[0].name + ': ' + pyDecText);
+
+  // --- Test 9: Python encrypts → Go decrypts ---
+  console.log('9. Python encrypts → Go decrypts');
+  execSync(
+    `cd ${join(root, 'sdk/go')} && go run ${join(tmpDir, 'go_helper.go')} keygen ${join(tmpDir, 'go_kem_keys2.json')}`,
+    { encoding: 'utf-8' }
+  );
+  const goKemKeys2 = JSON.parse(readFileSync(join(tmpDir, 'go_kem_keys2.json'), 'utf-8'));
+  const pyEncForGo = JSON.stringify([{ name: 'greetings.txt', data: Buffer.from('hello from Python to Go').toString('base64') }]);
+  const pyContainerForGo = execSync(
+    `cd ${pyDir} && echo '${pyEncForGo}' | ${pyBin} encrypt ${pyDsaSk} py-sender ${goKemKeys2.kem_pub} go-recipient`,
+    { encoding: 'buffer' }
+  );
+  writeFileSync(join(tmpDir, 'py-for-go.cef'), pyContainerForGo);
+  writeFileSync(join(tmpDir, 'py-for-go-keys.json'), JSON.stringify({
+    sender_pub: pyDsaPk, recip_sec: goKemKeys2.kem_sec, recip_kid: 'go-recipient',
+  }));
+  const goDecPy = execSync(
+    `cd ${join(root, 'sdk/go')} && go run ${join(tmpDir, 'go_helper.go')} decrypt ${join(tmpDir, 'py-for-go.cef')} ${join(tmpDir, 'py-for-go-keys.json')}`,
+    { encoding: 'utf-8' }
+  );
+  console.log('   ' + goDecPy.trim());
+
+  // --- Test 10: Go encrypts → Python decrypts ---
+  console.log('10. Go encrypts → Python decrypts');
+  writeFileSync(join(tmpDir, 'go_enc_for_py.go'), goEncForRust.replace(/Rust/g, 'Python').replace(/rust-recipient/g, 'py-recipient'));
+  const goEncPyOut = execSync(
+    `cd ${join(root, 'sdk/go')} && go run ${join(tmpDir, 'go_enc_for_py.go')} ${join(tmpDir, 'go-for-py.cef')} ${join(tmpDir, 'go-for-py-keys.json')} ${pyKemPk}`,
+    { encoding: 'utf-8' }
+  );
+  console.log('   ' + goEncPyOut.trim().replace('Rust', 'Python'));
+  const goForPyKeys = JSON.parse(readFileSync(join(tmpDir, 'go-for-py-keys.json'), 'utf-8'));
+  const pyDecGoOutput = execSync(
+    `cd ${pyDir} && ${pyBin} decrypt ${pyKemSk} py-recipient ${goForPyKeys.sender_pub} < ${join(tmpDir, 'go-for-py.cef')}`,
+    { encoding: 'utf-8' }
+  );
+  const pyDecGoFiles = JSON.parse(pyDecGoOutput);
+  const pyDecGoText = Buffer.from(pyDecGoFiles[0].data, 'base64').toString('utf-8');
+  if (pyDecGoText !== 'hello from Go to Python') { console.error('FAIL:', pyDecGoText); process.exit(1); }
+  console.log('   OK: ' + pyDecGoFiles[0].name + ': ' + pyDecGoText);
+
+  // --- Test 11: Python encrypts → Rust decrypts ---
+  console.log('11. Python encrypts → Rust decrypts');
+  const pyEncForRust = JSON.stringify([{ name: 'greetings.txt', data: Buffer.from('hello from Python to Rust').toString('base64') }]);
+  const pyContainerForRust = execSync(
+    `cd ${pyDir} && echo '${pyEncForRust}' | ${pyBin} encrypt ${pyDsaSk} py-sender ${rustKemPk} rust-recipient`,
+    { encoding: 'buffer' }
+  );
+  writeFileSync(join(tmpDir, 'py-for-rust.cef'), pyContainerForRust);
+  const rustDecPyOutput = execSync(
+    `${rustBin} decrypt ${rustKemSk} rust-recipient ${pyDsaPk} < ${join(tmpDir, 'py-for-rust.cef')}`,
+    { encoding: 'utf-8' }
+  );
+  const rustDecPyFiles = JSON.parse(rustDecPyOutput);
+  const rustDecPyText = Buffer.from(rustDecPyFiles[0].data, 'base64').toString('utf-8');
+  if (rustDecPyText !== 'hello from Python to Rust') { console.error('FAIL:', rustDecPyText); process.exit(1); }
+  console.log('   OK: ' + rustDecPyFiles[0].name + ': ' + rustDecPyText);
+
+  // --- Test 12: Rust encrypts → Python decrypts ---
+  console.log('12. Rust encrypts → Python decrypts');
+  const rustEncForPy = JSON.stringify([{ name: 'greetings.txt', data: Buffer.from('hello from Rust to Python').toString('base64') }]);
+  const rustContainerForPy = execSync(
+    `echo '${rustEncForPy}' | ${rustBin} encrypt ${rustDsaSk} rust-sender ${pyKemPk} py-recipient`,
+    { encoding: 'buffer' }
+  );
+  writeFileSync(join(tmpDir, 'rust-for-py.cef'), rustContainerForPy);
+  const pyDecRustOutput = execSync(
+    `cd ${pyDir} && ${pyBin} decrypt ${pyKemSk} py-recipient ${rustDsaPk} < ${join(tmpDir, 'rust-for-py.cef')}`,
+    { encoding: 'utf-8' }
+  );
+  const pyDecRustFiles = JSON.parse(pyDecRustOutput);
+  const pyDecRustText = Buffer.from(pyDecRustFiles[0].data, 'base64').toString('utf-8');
+  if (pyDecRustText !== 'hello from Rust to Python') { console.error('FAIL:', pyDecRustText); process.exit(1); }
+  console.log('   OK: ' + pyDecRustFiles[0].name + ': ' + pyDecRustText);
 
   console.log('\n=== All interop tests passed ===');
 } finally {

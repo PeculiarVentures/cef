@@ -103,3 +103,22 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -- -D warnings -A clippy::type_complexity
+
+  python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pqcrypto cryptography cbor2 pytest
+
+      - name: Test
+        run: python -m pytest tests/ -v

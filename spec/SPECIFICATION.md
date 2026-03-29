@@ -491,6 +491,14 @@ The payload for the Sig_structure is the **encrypted manifest bytes**
 (the raw COSE_Encrypt CBOR), not the plaintext manifest. This allows
 signature verification without decryption.
 
+**Verification MUST fail closed**: If signature verification produces a
+negative result (returns false, returns an error, or throws an
+exception), the implementation MUST treat this as an error and MUST NOT
+proceed with manifest or file decryption. Implementations MUST NOT
+silently ignore a negative verification result regardless of how the
+underlying cryptographic library signals failure (boolean return, error
+code, or exception).
+
 **Algorithms**:
 
 | Value | Name | Description | Default |

@@ -231,27 +231,30 @@ let dec = decrypt(&result.container, DecryptOptions {
 use cef::format::{cose, container, crypto, pq};
 ```
 
-### Python (future)
+### Python
 
 ```python
-from cef import encrypt, decrypt
+from cef import encrypt, decrypt, verify, FileInput, Sender, Recipient
+from cef.pq import mlkem_keygen, mldsa_keygen
+from cef.container import SenderClaims
+
+sender = mldsa_keygen()
+recip = mlkem_keygen()
 
 result = encrypt(
-    files=[{"name": "report.pdf", "data": pdf_bytes}],
-    sender={"signing_key": sender_sec, "kid": "alice"},
-    recipients=[{"kid": "bob", "encryption_key": bob_pub}],
+    files=[FileInput("report.pdf", pdf_bytes, content_type="application/pdf")],
+    sender=Sender(
+        signing_key=sender.secret_key, kid="alice",
+        claims=SenderClaims(email="alice@example.com", classification="SECRET"),
+    ),
+    recipients=[Recipient(kid="bob", encryption_key=recip.public_key)],
 )
 
-dec = decrypt(result.container,
-    recipient={"kid": "bob", "decryption_key": bob_sec},
-    verify=sender_pub,
-)
+dec = decrypt(result.container, "bob", recip.secret_key,
+              verify_key=sender.public_key)
 
-# Core primitives
-from cef.core import cose, container
-
-# GoodKey integration (pip install cef[goodkey])
-from cef.goodkey import create_adapter
+# Format layer available directly
+from cef import cose, container, crypto, pq
 ```
 
 ### Java (future)
