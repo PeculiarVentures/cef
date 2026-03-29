@@ -222,6 +222,25 @@ let dec = decrypt(&result.container, DecryptOptions {
 }).unwrap();
 ```
 
+## Example (Python, post-quantum)
+
+```python
+from cef import encrypt, decrypt, FileInput, Sender, Recipient
+from cef.pq import mlkem_keygen, mldsa_keygen
+
+sender = mldsa_keygen()
+recip = mlkem_keygen()
+
+result = encrypt(
+    files=[FileInput("secret.pdf", doc_bytes)],
+    sender=Sender(signing_key=sender.secret_key, kid="alice"),
+    recipients=[Recipient(kid="bob", encryption_key=recip.public_key)],
+)
+
+dec = decrypt(result.container, "bob", recip.secret_key,
+              verify_key=sender.public_key)
+```
+
 ## Repository Structure
 
 ```
@@ -247,10 +266,18 @@ cef/
     ├── typescript/            TypeScript SDK
     │   ├── src/cef.ts         Workflow API: encrypt/decrypt/verify
     │   └── src/format/        Format layer (COSE, container, crypto, PQ)
+
+    └── python/                Python SDK
+        ├── cef/               Package: crypto, pq, cose, container, workflow
+        └── tests/             Test suite
     │
     └── rust/                  Rust SDK
         ├── src/lib.rs         Workflow API: encrypt/decrypt/verify
         └── src/format/        Format layer (COSE, container, crypto, PQ)
+
+    └── python/                Python SDK
+        ├── cef/               Package: crypto, pq, cose, container, workflow
+        └── tests/             Test suite
 ```
 
 ## Specification
@@ -267,6 +294,7 @@ containers matching the spec is interoperable.
 | Go | `sdk/go/` | Reference implementation (classical + PQ) |
 | TypeScript | `sdk/typescript/` | v0 prototyping (classical via WebCrypto, PQ via @noble/post-quantum) |
 | Rust | `sdk/rust/` | PQ implementation (ML-KEM-768 + ML-DSA-65 via RustCrypto) |
+| Python | `sdk/python/` | PQ implementation (ML-KEM-768 + ML-DSA-65 via pqcrypto) |
 
 The Go SDK includes both the format layer (`format/`) and a GoodKey-backed
 implementation (`goodkey/`). The format layer has no GoodKey dependency and
