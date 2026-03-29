@@ -13,14 +13,14 @@
 //!     files: vec![FileInput { name: "hello.txt".into(), data: b"hello".to_vec(), content_type: None }],
 //!     sender: Sender { signing_key: sender_kp.secret_key, kid: "alice".into(), x5c: None, claims: None },
 //!     recipients: vec![Recipient { kid: "bob".into(), encryption_key: recip_kp.public_key.clone(), recipient_type: None }],
-//!     timestamp: None,
+//!     timestamp: None, key_wrap: None, sign: None,
 //! }).unwrap();
 //!
 //! let dec = decrypt(&result.container, DecryptOptions {
 //!     recipient_kid: "bob".into(),
 //!     decryption_key: recip_kp.secret_key,
 //!     verify_key: Some(sender_kp.public_key),
-//!     skip_signature_verification: false,
+//!     skip_signature_verification: false, key_unwrap: None, verify_fn: None,
 //! }).unwrap();
 //!
 //! assert_eq!(dec.files[0].original_name, "hello.txt");
@@ -65,6 +65,10 @@ pub struct EncryptOptions {
     pub sender: Sender,
     pub recipients: Vec<Recipient>,
     pub timestamp: Option<Vec<u8>>,
+    /// Custom key wrap callback (HSM, cloud KMS). When set, Recipients[].encryption_key is ignored.
+    pub key_wrap: Option<Box<dyn Fn(&[u8], &cose::RecipientInfo) -> Result<Vec<u8>, error::CefError>>>,
+    /// Custom sign callback. When set, Sender.signing_key is ignored.
+    pub sign: Option<Box<dyn Fn(&[u8]) -> Result<Vec<u8>, error::CefError>>>,
 }
 
 /// Result of encrypt().
@@ -81,6 +85,10 @@ pub struct DecryptOptions {
     pub decryption_key: Vec<u8>,
     pub verify_key: Option<Vec<u8>>,
     pub skip_signature_verification: bool,
+    /// Custom key unwrap callback (HSM, cloud KMS). When set, decryption_key is ignored.
+    pub key_unwrap: Option<Box<dyn Fn(&[u8], &cose::Recipient) -> Result<Vec<u8>, error::CefError>>>,
+    /// Custom verify callback. When set, verify_key is ignored.
+    pub verify_fn: Option<Box<dyn Fn(&[u8], &[u8]) -> Result<(), error::CefError>>>,
 }
 
 /// A decrypted file.
@@ -125,24 +133,36 @@ pub fn encrypt(opts: EncryptOptions) -> Result<EncryptResult, CefError> {
     }
 
     let mut pub_keys = HashMap::new();
-    for r in &opts.recipients {
-        if r.encryption_key.is_empty() {
-            return Err(CefError::General(format!(
-                "cef: recipient \"{}\" has no encryption key", r.kid
-            )));
+    if opts.key_wrap.is_none() {
+        for r in &opts.recipients {
+            if r.encryption_key.is_empty() {
+                return Err(CefError::General(format!(
+                    "cef: recipient \"{}\" has no encryption key", r.kid
+                )));
+            }
+            pub_keys.insert(r.kid.clone(), r.encryption_key.clone());
         }
-        pub_keys.insert(r.kid.clone(), r.encryption_key.clone());
     }
 
-    let wrap_cek = |cek: &[u8], ri: &cose::RecipientInfo| -> Result<Vec<u8>, CefError> {
-        let pk = pub_keys.get(&ri.key_id)
-            .ok_or_else(|| CefError::General(format!("cef: no public key for \"{}\"", ri.key_id)))?;
-        pq::mlkem_wrap(pk, cek)
-    };
+    let wrap_cek: Box<dyn Fn(&[u8], &cose::RecipientInfo) -> Result<Vec<u8>, CefError>> =
+        if let Some(ref custom) = opts.key_wrap {
+            Box::new(|cek: &[u8], ri: &cose::RecipientInfo| custom(cek, ri))
+        } else {
+            let keys = pub_keys.clone();
+            Box::new(move |cek: &[u8], ri: &cose::RecipientInfo| {
+                let pk = keys.get(&ri.key_id)
+                    .ok_or_else(|| CefError::General(format!("cef: no public key for \"{}\"", ri.key_id)))?;
+                pq::mlkem_wrap(pk, cek)
+            })
+        };
 
-    let sign_fn = |sig_structure: &[u8]| -> Result<Vec<u8>, CefError> {
-        pq::mldsa_sign(&opts.sender.signing_key, sig_structure)
-    };
+    let sign_fn: Box<dyn Fn(&[u8]) -> Result<Vec<u8>, CefError>> =
+        if let Some(ref custom) = opts.sign {
+            Box::new(|data: &[u8]| custom(data))
+        } else {
+            let sk = opts.sender.signing_key.clone();
+            Box::new(move |sig_structure: &[u8]| pq::mldsa_sign(&sk, sig_structure))
+        };
 
     // Sender info
     let sender_claims = if opts.sender.x5c.is_some() {
@@ -224,14 +244,19 @@ pub fn decrypt(data: &[u8], opts: DecryptOptions) -> Result<DecryptResult, CefEr
     let mut sig_valid: Option<bool> = None;
     if let Some(ref sig_bytes) = container.manifest_signature {
         if !opts.skip_signature_verification {
-            let vk = opts.verify_key.as_ref().ok_or_else(|| {
-                CefError::General("cef: sender verification key required (or set skip_signature_verification)".into())
-            })?;
             let sig1 = cose::unmarshal_sign1(sig_bytes)?;
             let enc_m = container.encrypted_manifest.as_ref()
                 .ok_or_else(|| CefError::General("cef: no encrypted manifest".into()))?;
-            let vfn = |ss: &[u8], s: &[u8]| pq::mldsa_verify(vk, ss, s);
-            match cose::verify1(&sig1, Some(enc_m), &vfn) {
+            let vfn: Box<dyn Fn(&[u8], &[u8]) -> Result<(), CefError>> =
+                if let Some(ref custom) = opts.verify_fn {
+                    Box::new(|ss: &[u8], s: &[u8]| custom(ss, s))
+                } else {
+                    let vk = opts.verify_key.as_ref().ok_or_else(|| {
+                        CefError::General("cef: sender verification key required (or set skip_signature_verification)".into())
+                    })?.clone();
+                    Box::new(move |ss: &[u8], s: &[u8]| pq::mldsa_verify(&vk, ss, s))
+                };
+            match cose::verify1(&sig1, Some(enc_m), &*vfn) {
                 Ok(()) => sig_valid = Some(true),
                 Err(e) => return Err(CefError::General(format!("cef: signature verification failed: {e}"))),
             }
@@ -241,10 +266,16 @@ pub fn decrypt(data: &[u8], opts: DecryptOptions) -> Result<DecryptResult, CefEr
     // Decrypt manifest
     let enc_m_bytes = container.encrypted_manifest.as_ref()
         .ok_or_else(|| CefError::General("cef: no encrypted manifest".into()))?;
-    let unwrap = |w: &[u8], _: &cose::Recipient| pq::mlkem_unwrap(&opts.decryption_key, w);
+    let unwrap: Box<dyn Fn(&[u8], &cose::Recipient) -> Result<Vec<u8>, CefError>> =
+        if let Some(ref custom) = opts.key_unwrap {
+            Box::new(|w: &[u8], r: &cose::Recipient| custom(w, r))
+        } else {
+            let dk = opts.decryption_key.clone();
+            Box::new(move |w: &[u8], _: &cose::Recipient| pq::mlkem_unwrap(&dk, w))
+        };
     let enc_m = cose::unmarshal_encrypt(enc_m_bytes)?;
     let idx = cose::find_recipient_index(&enc_m, &opts.recipient_kid)?;
-    let m_bytes = cose::decrypt(&enc_m, idx, &unwrap)?;
+    let m_bytes = cose::decrypt(&enc_m, idx, &*unwrap)?;
     let manifest = unmarshal_manifest(&m_bytes)?;
 
     // Truncation check
@@ -375,7 +406,7 @@ mod tests {
                 encryption_key: recip.public_key,
                 recipient_type: None,
             }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         })
         .unwrap();
 
@@ -387,7 +418,7 @@ mod tests {
             recipient_kid: "bob".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         })
         .unwrap();
 
@@ -419,14 +450,14 @@ mod tests {
                 encryption_key: recip.public_key,
                 recipient_type: None,
             }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
 
         let dec = decrypt(&result.container, DecryptOptions {
             recipient_kid: "bob".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
 
         assert_eq!(dec.files.len(), 2);
@@ -448,7 +479,7 @@ mod tests {
                 Recipient { kid: "bob".into(), encryption_key: bob.public_key, recipient_type: None },
                 Recipient { kid: "carol".into(), encryption_key: carol.public_key, recipient_type: None },
             ],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
 
         // Bob decrypts
@@ -456,7 +487,7 @@ mod tests {
             recipient_kid: "bob".into(),
             decryption_key: bob.secret_key,
             verify_key: Some(sender.public_key.clone()),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert_eq!(dec1.files[0].data, b"multi");
 
@@ -465,7 +496,7 @@ mod tests {
             recipient_kid: "carol".into(),
             decryption_key: carol.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert_eq!(dec2.files[0].data, b"multi");
     }
@@ -479,7 +510,7 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "alice".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "bob".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
 
         let vr = verify(&result.container, VerifyOptions { verify_key: sender.public_key }).unwrap();
@@ -497,7 +528,7 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "alice".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "bob".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
 
         let vr = verify(&result.container, VerifyOptions { verify_key: wrong.public_key }).unwrap();
@@ -514,14 +545,14 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"secret".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "alice".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "bob".into(), encryption_key: bob.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
 
         let err = decrypt(&result.container, DecryptOptions {
             recipient_kid: "bob".into(),
             decryption_key: eve.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: true,
+            skip_signature_verification: true, key_unwrap: None, verify_fn: None,
         });
         assert!(err.is_err());
     }
@@ -533,7 +564,7 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         });
         assert!(err.is_err());
     }
@@ -546,7 +577,7 @@ mod tests {
             files: vec![],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         });
         assert!(err.is_err());
     }
@@ -573,13 +604,13 @@ mod tests {
             }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         let dec = decrypt(&result.container, DecryptOptions {
             recipient_kid: "b".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert!(!dec.files[0].original_name.contains(".."));
         assert!(!dec.files[0].original_name.contains('/'));
@@ -593,14 +624,14 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"data".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         // Decrypt without verify key, skipping verification
         let dec = decrypt(&result.container, DecryptOptions {
             recipient_kid: "b".into(),
             decryption_key: recip.secret_key,
             verify_key: None,
-            skip_signature_verification: true,
+            skip_signature_verification: true, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert_eq!(dec.files[0].data, b"data");
         assert!(dec.signature_valid.is_none());
@@ -614,14 +645,14 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         // Decrypt without verify key and without skip → must fail
         let err = decrypt(&result.container, DecryptOptions {
             recipient_kid: "b".into(),
             decryption_key: recip.secret_key,
             verify_key: None,
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         });
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("verification key required"));
@@ -635,7 +666,7 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         // Corrupt the container
         let mut corrupted = result.container.clone();
@@ -647,7 +678,7 @@ mod tests {
             recipient_kid: "b".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: true,
+            skip_signature_verification: true, key_unwrap: None, verify_fn: None,
         });
         assert!(err.is_err());
     }
@@ -670,13 +701,13 @@ mod tests {
                 }),
             },
             recipients: vec![Recipient { kid: "bob".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         let dec = decrypt(&result.container, DecryptOptions {
             recipient_kid: "bob".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert_eq!(dec.sender_kid, "alice");
         let claims = dec.sender_claims.unwrap();
@@ -694,13 +725,13 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "bob".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         let err = decrypt(&result.container, DecryptOptions {
             recipient_kid: "eve".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: true,
+            skip_signature_verification: true, key_unwrap: None, verify_fn: None,
         });
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("not found"));
@@ -715,7 +746,7 @@ mod tests {
             files: vec![FileInput { name: "t.txt".into(), data: b"x".to_vec(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         // verify() with wrong key
         let vr = verify(&result.container, VerifyOptions { verify_key: wrong.public_key }).unwrap();
@@ -730,13 +761,13 @@ mod tests {
             files: vec![FileInput { name: "empty.bin".into(), data: vec![], content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         let dec = decrypt(&result.container, DecryptOptions {
             recipient_kid: "b".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert_eq!(dec.files[0].data, b"");
         assert_eq!(dec.files[0].original_name, "empty.bin");
@@ -751,13 +782,13 @@ mod tests {
             files: vec![FileInput { name: "big.bin".into(), data: large.clone(), content_type: None }],
             sender: Sender { signing_key: sender.secret_key, kid: "a".into(), x5c: None, claims: None },
             recipients: vec![Recipient { kid: "b".into(), encryption_key: recip.public_key, recipient_type: None }],
-            timestamp: None,
+            timestamp: None, key_wrap: None, sign: None,
         }).unwrap();
         let dec = decrypt(&result.container, DecryptOptions {
             recipient_kid: "b".into(),
             decryption_key: recip.secret_key,
             verify_key: Some(sender.public_key),
-            skip_signature_verification: false,
+            skip_signature_verification: false, key_unwrap: None, verify_fn: None,
         }).unwrap();
         assert_eq!(dec.files[0].data.len(), 1_000_000);
         assert_eq!(dec.files[0].data, large);
