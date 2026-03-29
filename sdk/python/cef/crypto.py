@@ -60,3 +60,9 @@ def random_bytes(length: int) -> bytes:
 
 def constant_time_compare(a: bytes, b: bytes) -> bool:
     return hmac.compare_digest(a, b)
+
+
+def zeroize(buf: bytearray) -> None:
+    """Best-effort zeroization. Works on bytearray, not immutable bytes."""
+    for i in range(len(buf)):
+        buf[i] = 0
