@@ -65,7 +65,7 @@ fn encrypt(args: &[String]) {
             encryption_key: recip_pk,
             recipient_type: None,
         }],
-        timestamp: None,
+        timestamp: None, key_wrap: None, sign: None,
     }).unwrap();
 
     io::stdout().write_all(&result.container).unwrap();
@@ -88,7 +88,7 @@ fn decrypt(args: &[String]) {
         recipient_kid: recip_kid.to_string(),
         decryption_key: recip_sk,
         verify_key: Some(sender_pk),
-        skip_signature_verification: false,
+        skip_signature_verification: false, key_unwrap: None, verify_fn: None,
     }).unwrap();
 
     // Output as JSON

@@ -5555,7 +5555,7 @@ async function encrypt2(opts2) {
     timestamp: opts2.timestamp
   };
   const result = await encryptFiles(
-    opts2.files.map((f) => ({ name: f.name, data: f.data, contentType: f.contentType })),
+    opts2.files.map((f) => ({ name: sanitizeName(f.name), data: f.data, contentType: f.contentType })),
     internal
   );
   return {
@@ -5588,7 +5588,7 @@ async function decrypt2(container, opts2) {
   else signature = "failed";
   return {
     files: result.files.map((f) => ({
-      originalName: f.originalName,
+      originalName: sanitizeName(f.originalName),
       data: f.data,
       size: f.size
     })),
@@ -5615,6 +5615,11 @@ async function verify(container, opts2) {
     timestampPresent: false
     // TODO: check container for manifest.tst
   };
+}
+function sanitizeName(name) {
+  const base = name.replace(/\\/g, "/").split("/").pop() || "";
+  if (!base || base === "." || base === "..") return "unnamed";
+  return base.replace(/\.\./g, "_");
 }
 export {
   HeaderAlgorithm,

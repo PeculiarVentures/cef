@@ -93,26 +93,34 @@ def encrypt(
     sender: Sender,
     recipients: list[Recipient],
     timestamp: Optional[bytes] = None,
+    key_wrap: Optional[callable] = None,
+    sign_fn_override: Optional[callable] = None,
 ) -> EncryptResult:
     if not recipients:
         raise ValueError("cef: at least one recipient is required")
     if not files:
         raise ValueError("cef: at least one file is required")
 
-    pub_keys = {}
-    for r in recipients:
-        if not r.encryption_key:
-            raise ValueError(f'cef: recipient "{r.kid}" has no encryption key')
-        pub_keys[r.kid] = r.encryption_key
+    if key_wrap:
+        wrap_cek = key_wrap
+    else:
+        pub_keys = {}
+        for r in recipients:
+            if not r.encryption_key:
+                raise ValueError(f'cef: recipient "{r.kid}" has no encryption key')
+            pub_keys[r.kid] = r.encryption_key
 
-    def wrap_cek(cek_bytes: bytes, ri: cose.RecipientInfo) -> bytes:
-        pk = pub_keys.get(ri.key_id)
-        if pk is None:
-            raise ValueError(f'cef: no public key for recipient "{ri.key_id}"')
-        return pq.mlkem_wrap(pk, cek_bytes)
+        def wrap_cek(cek_bytes: bytes, ri: cose.RecipientInfo) -> bytes:
+            pk = pub_keys.get(ri.key_id)
+            if pk is None:
+                raise ValueError(f'cef: no public key for recipient "{ri.key_id}"')
+            return pq.mlkem_wrap(pk, cek_bytes)
 
-    def sign_fn(sig_structure: bytes) -> bytes:
-        return pq.mldsa_sign(sender.signing_key, sig_structure)
+    if sign_fn_override:
+        sign_fn = sign_fn_override
+    else:
+        def sign_fn(sig_structure: bytes) -> bytes:
+            return pq.mldsa_sign(sender.signing_key, sig_structure)
 
     cose_recipients = [
         cose.RecipientInfo(
@@ -181,13 +189,15 @@ def encrypt(
 def decrypt(
     container_bytes: bytes,
     recipient_kid: str,
-    decryption_key: bytes,
+    decryption_key: bytes = b"",
     verify_key: Optional[bytes] = None,
     skip_signature_verification: bool = False,
+    key_unwrap: Optional[callable] = None,
+    verify_fn_override: Optional[callable] = None,
 ) -> DecryptResult:
     if not recipient_kid:
         raise ValueError("cef: recipient kid is required")
-    if not decryption_key:
+    if not decryption_key and not key_unwrap:
         raise ValueError("cef: recipient decryption key is required")
 
     container = read_container(container_bytes)
@@ -195,14 +205,17 @@ def decrypt(
     # Verify signature
     sig_valid = None
     if container.manifest_signature and not skip_signature_verification:
-        if not verify_key:
+        if verify_fn_override:
+            _verify_fn = verify_fn_override
+        elif verify_key:
+            _verify_fn = lambda ss, s: pq.mldsa_verify(verify_key, ss, s)
+        else:
             raise ValueError(
                 "cef: sender verification key required (or set skip_signature_verification)"
             )
         sig1 = cose.unmarshal_sign1(container.manifest_signature)
-        verify_fn = lambda ss, s: pq.mldsa_verify(verify_key, ss, s)
         try:
-            cose.verify1(sig1, container.encrypted_manifest, verify_fn)
+            cose.verify1(sig1, container.encrypted_manifest, _verify_fn)
             sig_valid = True
         except Exception as e:
             raise ValueError(f"cef: signature verification failed: {e}") from e
@@ -211,8 +224,11 @@ def decrypt(
         raise ValueError("cef: no encrypted manifest")
 
     # Decrypt manifest
-    def unwrap(wrapped: bytes, _r: cose.Recipient) -> bytes:
-        return pq.mlkem_unwrap(decryption_key, wrapped)
+    if key_unwrap:
+        unwrap = key_unwrap
+    else:
+        def unwrap(wrapped: bytes, _r: cose.Recipient) -> bytes:
+            return pq.mlkem_unwrap(decryption_key, wrapped)
 
     enc_manifest = cose.unmarshal_encrypt(container.encrypted_manifest)
     idx = cose.find_recipient_index(enc_manifest, recipient_kid)

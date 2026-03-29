@@ -228,7 +228,7 @@ export async function encrypt(opts: EncryptOptions): Promise<EncryptResult> {
   };
 
   const result: InternalEncryptResult = await encryptFiles(
-    opts.files.map(f => ({ name: f.name, data: f.data, contentType: f.contentType } as FileInput)),
+    opts.files.map(f => ({ name: sanitizeName(f.name), data: f.data, contentType: f.contentType } as FileInput)),
     internal,
   );
 
@@ -285,7 +285,7 @@ export async function decrypt(
 
   return {
     files: result.files.map(f => ({
-      originalName: f.originalName,
+      originalName: sanitizeName(f.originalName),
       data: f.data,
       size: f.size,
     })),
@@ -320,4 +320,11 @@ export async function verify(
     senderKid: result.senderKid,
     timestampPresent: false, // TODO: check container for manifest.tst
   };
+}
+
+/** Strip path components to prevent path traversal. */
+function sanitizeName(name: string): string {
+  const base = name.replace(/\\/g, '/').split('/').pop() || '';
+  if (!base || base === '.' || base === '..') return 'unnamed';
+  return base.replace(/\.\./g, '_');
 }

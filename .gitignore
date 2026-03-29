@@ -25,3 +25,4 @@ sdk/go/cef
 sdk/typescript/docs/
 sdk/rust/target/
 __pycache__/
+.pytest_cache/
