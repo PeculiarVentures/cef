@@ -58,8 +58,12 @@ def mlkem_wrap(public_key: bytes, cek: bytes) -> bytes:
     if len(public_key) != MLKEM768_PK_SIZE:
         raise ValueError(f"ML-KEM-768 public key must be {MLKEM768_PK_SIZE} bytes, got {len(public_key)}")
     ct, ss = _kem_encapsulate(public_key)
-    kek = _derive_kek(ss)
-    wrapped = crypto.aes_kw_wrap(kek, cek)
+    ss_buf = bytearray(ss)
+    kek = _derive_kek(bytes(ss_buf))
+    kek_buf = bytearray(kek)
+    crypto.zeroize(ss_buf)
+    wrapped = crypto.aes_kw_wrap(bytes(kek_buf), cek)
+    crypto.zeroize(kek_buf)
     return ct + wrapped
 
 
@@ -71,8 +75,13 @@ def mlkem_unwrap(secret_key: bytes, wrapped_data: bytes) -> bytes:
     ct = wrapped_data[:MLKEM768_CT_SIZE]
     wrapped_cek = wrapped_data[MLKEM768_CT_SIZE:]
     ss = _kem_decapsulate(secret_key, ct)
-    kek = _derive_kek(ss)
-    return crypto.aes_kw_unwrap(kek, wrapped_cek)
+    ss_buf = bytearray(ss)
+    kek = _derive_kek(bytes(ss_buf))
+    kek_buf = bytearray(kek)
+    crypto.zeroize(ss_buf)
+    cek = crypto.aes_kw_unwrap(bytes(kek_buf), wrapped_cek)
+    crypto.zeroize(kek_buf)
+    return cek
 
 
 def mldsa_sign(secret_key: bytes, message: bytes) -> bytes:
