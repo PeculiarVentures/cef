@@ -292,7 +292,7 @@ containers matching the spec is interoperable.
 | Language | Path | Status |
 |----------|------|--------|
 | Go | `sdk/go/` | Reference implementation (classical + PQ) |
-| TypeScript | `sdk/typescript/` | v0 prototyping (classical via WebCrypto, PQ via @noble/post-quantum) |
+| TypeScript | `sdk/typescript/` | classical via WebCrypto, PQ implementation (ML-KEM-768 + ML-DSA-65 via via @noble/post-quantum))|
 | Rust | `sdk/rust/` | PQ implementation (ML-KEM-768 + ML-DSA-65 via RustCrypto) |
 | Python | `sdk/python/` | PQ implementation (ML-KEM-768 + ML-DSA-65 via pqcrypto) |
 
